@@ -1,0 +1,21 @@
+# Dependencies
+node_modules/
+
+# Environment / credentials
+.env
+*.env.*
+
+# Runtime state (per-user)
+.omc/
+.claude/
+
+# OS artifacts
+.DS_Store
+Thumbs.db
+
+# Editor
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
