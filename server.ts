@@ -72,6 +72,51 @@ const mm: MmClient = createMmClient(
   MATTERMOST_TOKEN ?? '',
 )
 
+// ── Heartbeat & status state ───────────────────────────────────────────────
+
+const activeHeartbeats = new Map<string, {
+  timer: ReturnType<typeof setInterval>
+  maxTimer: ReturnType<typeof setTimeout>
+  channelId: string
+  parentId?: string
+}>()
+
+const activeStatusPosts = new Map<string, string>() // channelId → postId
+
+function stopHeartbeat(channelId: string): void {
+  const hb = activeHeartbeats.get(channelId)
+  if (hb) {
+    clearInterval(hb.timer)
+    clearTimeout(hb.maxTimer)
+    activeHeartbeats.delete(channelId)
+  }
+}
+
+function cleanupChannel(channelId: string): void {
+  stopHeartbeat(channelId)
+  const statusPostId = activeStatusPosts.get(channelId)
+  if (statusPostId) {
+    activeStatusPosts.delete(channelId)
+    void mm.del(`/posts/${statusPostId}`).catch(() => {})
+  }
+}
+
+function startHeartbeat(channelId: string, parentId?: string): void {
+  stopHeartbeat(channelId)
+  const timer = setInterval(() => {
+    mm.post('/users/me/typing', {
+      channel_id: channelId,
+      ...(parentId ? { parent_id: parentId } : {}),
+    }).catch(() => {})
+  }, 4000)
+  timer.unref()
+  const maxTimer = setTimeout(() => {
+    cleanupChannel(channelId)
+  }, 5 * 60 * 1000)
+  maxTimer.unref()
+  activeHeartbeats.set(channelId, { timer, maxTimer, channelId, parentId })
+}
+
 // ── Static mode ────────────────────────────────────────────────────────────
 
 const BOOT_ACCESS: Access | null = STATIC
@@ -203,6 +248,8 @@ const mcp = new Server(
       'Per-chat notes: messages may start with a [notes for this chat] block — these are saved preferences for this conversation. When the user states a preference, working directory, or recurring instruction (e.g. "always work in ~/tb-ocr", "respond in Korean"), call save_note with a short key and the preference. Notes are scoped per chat_id — they don\'t leak across conversations. Use get_notes to review and delete_note to clean up stale entries.',
       '',
       'Plan mode: messages may include a [mode: plan] block. When present, only research and plan — do NOT make code changes (no Edit, Write, or destructive Bash commands). Ask clarifying questions if needed — the user can reply normally while plan mode stays active. When ready, present your plan clearly and wait for the user to approve with !go. If the user sends !cancel, acknowledge and stop. When [mode: plan-approved] appears, execute the plan you previously presented.',
+      '',
+      'For long-running tasks (file analysis, multi-step work, test execution), call update_status periodically to show progress. Keep status text short — a few words with context. Example: "Analyzing 15 files...", "Running tests (2/5 done)...", "Writing implementation...". Call it at natural transition points, not every second. The status message is automatically cleaned up when you send your final reply. Do not use update_status for tasks that take less than ~10 seconds.',
     ].join('\n'),
   },
 )
@@ -326,6 +373,19 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
         required: ['chat_id', 'key'],
       },
     },
+    {
+      name: 'update_status',
+      description: 'Post or update a progress status message. First call posts a new message; subsequent calls edit it in place. The status message is automatically deleted when you send a reply. Use during long tasks to show progress.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chat_id: { type: 'string' },
+          status: { type: 'string', description: 'Short progress text, e.g. "Analyzing codebase...", "Running tests (3/5 done)..."' },
+          thread_id: { type: 'string', description: 'Thread to post status in. Optional.' },
+        },
+        required: ['chat_id', 'status'],
+      },
+    },
   ],
 }))
 
@@ -337,6 +397,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
     switch (req.params.name) {
       case 'reply': {
         const chatId = args.chat_id as string
+        cleanupChannel(chatId)
+
         const text = args.text as string
         const replyTo = args.reply_to as string | undefined
         const threadId = args.thread_id as string | undefined
@@ -424,6 +486,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       }
 
       case 'react': {
+        if (args.chat_id) stopHeartbeat(args.chat_id as string)
         const emojiName = (args.emoji as string).replace(/^:+|:+$/g, '')
         await mm.post('/reactions', {
           user_id: mm.botUserId,
@@ -434,6 +497,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
       }
 
       case 'edit_message': {
+        if (args.chat_id) stopHeartbeat(args.chat_id as string)
         await mm.put(`/posts/${args.message_id}/patch`, { message: args.text as string })
         return { content: [{ type: 'text', text: `edited (id: ${args.message_id})` }] }
       }
@@ -502,6 +566,40 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         return { content: [{ type: 'text', text: `note deleted: ${key}` }] }
       }
 
+      case 'update_status': {
+        const chatId = args.chat_id as string
+        const status = args.status as string
+        const threadId = args.thread_id as string | undefined
+        await assertAllowedChannel(chatId)
+
+        const access = loadAccess()
+        if (access.progressStatus === false) {
+          return { content: [{ type: 'text', text: 'status reporting disabled' }] }
+        }
+
+        const formatted = `_${status}_`
+        const existingPostId = activeStatusPosts.get(chatId)
+
+        if (existingPostId) {
+          try {
+            await mm.put(`/posts/${existingPostId}/patch`, { message: formatted })
+            return { content: [{ type: 'text', text: `status updated (id: ${existingPostId})` }] }
+          } catch {
+            // Post may have been deleted externally; fall through to create new
+            activeStatusPosts.delete(chatId)
+          }
+        }
+
+        const p = await mm.post('/posts', {
+          channel_id: chatId,
+          message: formatted,
+          ...(threadId ? { root_id: threadId } : {}),
+        })
+        activeStatusPosts.set(chatId, p.id)
+        noteSent(p.id)
+        return { content: [{ type: 'text', text: `status posted (id: ${p.id})` }] }
+      }
+
       default:
         return {
           content: [{ type: 'text', text: `unknown tool: ${req.params.name}` }],
@@ -530,6 +628,13 @@ function shutdown(): void {
   if (shuttingDown) return
   shuttingDown = true
   process.stderr.write('mattermost channel: shutting down\n')
+  // Clean up heartbeats
+  activeHeartbeats.forEach((_, id) => stopHeartbeat(id))
+  // Delete status messages so they don't linger in Mattermost
+  activeStatusPosts.forEach((postId) => {
+    void mm.del(`/posts/${postId}`).catch(() => {})
+  })
+  activeStatusPosts.clear()
   if (ws) {
     try { ws.close() } catch {}
   }
@@ -624,11 +729,16 @@ async function handleInbound(post: any, channelType: string, senderName: string)
     dmChannelToUser.set(chatId, post.user_id)
   }
 
-  // Typing indicator — signals "processing" until we reply
-  void mm.post('/users/me/typing', {
-    channel_id: chatId,
-    ...(post.root_id ? { parent_id: post.root_id } : {}),
-  }).catch(() => {})
+  // Typing heartbeat — keeps "is typing..." visible until we reply
+  if (access.typingHeartbeat !== false) {
+    startHeartbeat(chatId, post.root_id || undefined)
+  } else {
+    // Single typing indicator as fallback
+    void mm.post('/users/me/typing', {
+      channel_id: chatId,
+      ...(post.root_id ? { parent_id: post.root_id } : {}),
+    }).catch(() => {})
+  }
 
   // Ack reaction — fire-and-forget
   if (access.ackReaction) {
@@ -797,6 +907,17 @@ function startInboxWatcher(): void {
 
   function deliverInboxMessage(msg: InboxMessage): void {
     const chatId = msg.channelId
+
+    // Typing heartbeat — keeps "is typing..." visible until we reply
+    const access = loadAccess()
+    if (access.typingHeartbeat !== false) {
+      startHeartbeat(chatId, msg.rootId || undefined)
+    } else {
+      void mm.post('/users/me/typing', {
+        channel_id: chatId,
+        ...(msg.rootId ? { parent_id: msg.rootId } : {}),
+      }).catch(() => {})
+    }
 
     // Plan mode handling (modeCommand set by router)
     let modePrefix = ''

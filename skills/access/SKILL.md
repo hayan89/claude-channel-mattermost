@@ -109,12 +109,15 @@ Parse `$ARGUMENTS` (space-separated). If empty or unrecognized, show status.
 ### `set <key> <value>`
 
 Delivery/UX config. Supported keys: `ackReaction`, `replyToMode`,
-`textChunkLimit`, `chunkMode`, `mentionPatterns`. Validate types:
+`textChunkLimit`, `chunkMode`, `mentionPatterns`, `typingHeartbeat`,
+`progressStatus`. Validate types:
 - `ackReaction`: string (emoji short name, no colons) or `""` to disable
 - `replyToMode`: `off` | `first` | `all`
 - `textChunkLimit`: number
 - `chunkMode`: `length` | `newline`
 - `mentionPatterns`: JSON array of regex strings
+- `typingHeartbeat`: boolean — keep "is typing..." indicator alive during processing (default: true)
+- `progressStatus`: boolean — enable update_status tool for progress messages (default: true)
 
 Read, set the key, write, confirm.
 

@@ -70,6 +70,10 @@ export type Access = {
   textChunkLimit?: number
   /** Split on paragraph boundaries instead of hard char count. */
   chunkMode?: 'length' | 'newline'
+  /** Keep typing indicator alive while Claude is processing. Default: true. */
+  typingHeartbeat?: boolean
+  /** Enable progress status messages via update_status tool. Default: true. */
+  progressStatus?: boolean
 }
 
 export type GateResult =
@@ -163,6 +167,8 @@ export function readAccessFile(): Access {
       replyToMode: parsed.replyToMode,
       textChunkLimit: parsed.textChunkLimit,
       chunkMode: parsed.chunkMode,
+      typingHeartbeat: parsed.typingHeartbeat,
+      progressStatus: parsed.progressStatus,
     }
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return defaultAccess()
