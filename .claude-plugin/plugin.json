@@ -7,5 +7,11 @@
     "messaging",
     "channel",
     "mcp"
-  ]
+  ],
+  "author": {
+    "name": "hyunseung"
+  },
+  "homepage": "https://github.com/hayan89/claude-channel-mattermost",
+  "repository": "https://github.com/hayan89/claude-channel-mattermost",
+  "license": "Apache-2.0"
 }

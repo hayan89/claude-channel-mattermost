@@ -15,7 +15,8 @@ Mattermost 봇 계정을 통해 Claude Code와 메시지를 주고받을 수 있
 - **다층 접근 제어** — 페어링 코드, 허용 목록, 채널별 접근 제어, 정적 모드
 - **플랜 모드** — `!plan` / `!go` / `!cancel` 워크플로우로 실행 전 검토
 - **채널별 메모** — 채널 단위 컨텍스트를 세션 간 유지
-- **빌드 불필요** — Bun으로 바로 실행, 단일 TypeScript 파일
+- **멀티채널 라우터** — 채널별 독립된 Claude 인스턴스를 생성하는 데몬 모드 (선택)
+- **빌드 불필요** — Bun으로 바로 실행, 컴파일 불필요
 
 ## 사전 요구사항
 
@@ -189,6 +190,26 @@ Claude가 변경 없이 계획을 제시합니다. 이후:
 
 `!go` 또는 `!cancel` 전까지 플랜 모드가 유지됩니다. 일반 메시지는 계획 대화를 계속합니다.
 
+## 라우터 모드
+
+기본적으로 서버는 모든 채널을 하나의 Claude 세션에서 처리합니다. **라우터 모드**는 채널별로 독립된 Claude 인스턴스를 생성하여 완전한 격리를 제공합니다:
+
+```sh
+bun run router
+```
+
+각 채널은 `~/.claude/channels/mattermost/sessions/<channelId>/` 아래에 독립된 작업 디렉토리를 가지며, 메모·inbox·로그가 분리됩니다.
+
+라우터는 Mattermost WebSocket에 연결하여 수신 메시지의 채널을 식별하고, 해당 Claude 프로세스로 라우팅합니다 (필요 시 자동 생성).
+
+### 환경 변수 (라우터)
+
+| 변수 | 설명 |
+|------|------|
+| `MATTERMOST_URL` | Mattermost 서버 URL (단일 모드와 동일) |
+| `MATTERMOST_TOKEN` | 봇 액세스 토큰 (단일 모드와 동일) |
+| `MATTERMOST_STATE_DIR` | 기본 상태 디렉토리 (기본값: `~/.claude/channels/mattermost/`) |
+
 ## 자체 호스팅 참고사항
 
 - 봇에 `post:all` 및 `post:channels` 권한 필요 (또는 시스템 관리자)
@@ -217,7 +238,11 @@ Claude가 변경 없이 계획을 제시합니다. 이후:
 
 ## 기여
 
-서버는 하나의 의존성(`@modelcontextprotocol/sdk`)만 사용하는 단일 TypeScript 파일(`server.ts`)로, Bun에서 실행됩니다.
+코드베이스는 하나의 의존성(`@modelcontextprotocol/sdk`)만 사용하는 세 개의 TypeScript 파일로, Bun에서 실행됩니다:
+
+- `server.ts` — MCP 서버 (단일 채널 또는 채널 스코프 모드)
+- `shared.ts` — 공유 타입, 상수, 유틸리티
+- `router.ts` — 멀티채널 코디네이터 데몬
 
 ```sh
 git clone https://github.com/hayan89/claude-channel-mattermost.git

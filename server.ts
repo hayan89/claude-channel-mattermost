@@ -2,9 +2,13 @@
 /**
  * Mattermost channel for Claude Code.
  *
- * Self-contained MCP server with full access control: pairing, allowlists,
+ * MCP server with full access control: pairing, allowlists,
  * channel group support with mention-triggering. State lives in
  * ~/.claude/channels/mattermost/access.json — managed by the /mattermost:access skill.
+ *
+ * Supports two modes:
+ * - Legacy mode (default): WebSocket + all channels in one context
+ * - Channel scope mode (MATTERMOST_CHANNEL_SCOPE): single-channel, inbox-based IPC
  *
  * Uses raw fetch + Bun WebSocket (no @mattermost/client SDK).
  */
@@ -15,38 +19,33 @@ import {
   ListToolsRequestSchema,
   CallToolRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js'
-import { randomBytes } from 'crypto'
 import {
-  readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync,
-  statSync, renameSync, realpathSync, chmodSync, unlinkSync,
+  readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync, statSync,
+  renameSync, unlinkSync, watch,
 } from 'fs'
-import { homedir } from 'os'
-import { join, sep, basename } from 'path'
+import { basename, join } from 'path'
 
-// ── State paths ────────────────────────────────────────────────────────────
-
-const STATE_DIR = process.env.MATTERMOST_STATE_DIR ?? join(homedir(), '.claude', 'channels', 'mattermost')
-const ACCESS_FILE = join(STATE_DIR, 'access.json')
-const APPROVED_DIR = join(STATE_DIR, 'approved')
-const ENV_FILE = join(STATE_DIR, '.env')
-const INBOX_DIR = join(STATE_DIR, 'inbox')
-const MEMORY_DIR = join(STATE_DIR, 'memory')
-const MODES_DIR = join(STATE_DIR, 'modes')
+import {
+  APPROVED_DIR, ENV_FILE, INBOX_DIR,
+  MAX_CHUNK_LIMIT, MAX_ATTACHMENT_BYTES,
+  type Access, type MmClient, type AccessOps, type MentionContext, type InboxMessage,
+  loadEnvFile, createMmClient,
+  readAccessFile, saveAccess as sharedSaveAccess,
+  gate,
+  chunk, assertSendable, safeAttName,
+  readNotes, writeNotes, formatNotesPrefix,
+  readMode, writeMode, clearMode,
+} from './shared.js'
 
 // ── .env loader ────────────────────────────────────────────────────────────
-// Plugin-spawned servers don't get env blocks — credentials live here.
 
-try {
-  chmodSync(ENV_FILE, 0o600)
-  for (const line of readFileSync(ENV_FILE, 'utf8').split('\n')) {
-    const m = line.match(/^(\w+)=(.*)$/)
-    if (m && process.env[m[1]] === undefined) process.env[m[1]] = m[2]
-  }
-} catch {}
+loadEnvFile()
 
 const MATTERMOST_URL = process.env.MATTERMOST_URL
 const MATTERMOST_TOKEN = process.env.MATTERMOST_TOKEN
 const STATIC = process.env.MATTERMOST_ACCESS_MODE === 'static'
+const CHANNEL_SCOPE = process.env.MATTERMOST_CHANNEL_SCOPE
+const SESSION_DIR = process.env.MATTERMOST_SESSION_DIR
 
 if (!MATTERMOST_URL || !MATTERMOST_TOKEN) {
   process.stderr.write(
@@ -66,180 +65,12 @@ process.on('uncaughtException', err => {
   process.stderr.write(`mattermost channel: uncaught exception: ${err}\n`)
 })
 
-// ── Mattermost REST wrapper ────────────────────────────────────────────────
+// ── Mattermost REST client ─────────────────────────────────────────────────
 
-const mm = {
-  url: '',
-  token: '',
-  botUserId: '',
-  botUsername: '',
-
-  async api(method: string, path: string, body?: unknown): Promise<any> {
-    const res = await fetch(`${this.url}/api/v4${path}`, {
-      method,
-      headers: {
-        'Authorization': `Bearer ${this.token}`,
-        'Content-Type': 'application/json',
-      },
-      ...(body != null ? { body: JSON.stringify(body) } : {}),
-    })
-    if (!res.ok) {
-      const detail = await res.text().catch(() => '')
-      throw new Error(`MM API ${method} ${path}: ${res.status} ${detail}`)
-    }
-    const text = await res.text()
-    return text ? JSON.parse(text) : undefined
-  },
-
-  get(p: string) { return this.api('GET', p) },
-  post(p: string, b: unknown) { return this.api('POST', p, b) },
-  put(p: string, b: unknown) { return this.api('PUT', p, b) },
-  del(p: string) { return this.api('DELETE', p) },
-}
-
-// ── Types ──────────────────────────────────────────────────────────────────
-
-type PendingEntry = {
-  senderId: string
-  chatId: string   // DM channel ID — where to send the approval confirm
-  createdAt: number
-  expiresAt: number
-  replies: number
-}
-
-type GroupPolicy = {
-  requireMention: boolean
-  allowFrom: string[]
-}
-
-type Access = {
-  dmPolicy: 'pairing' | 'allowlist' | 'disabled'
-  allowFrom: string[]
-  /** Keyed on channel ID, not team ID. One entry per Mattermost channel. */
-  groups: Record<string, GroupPolicy>
-  pending: Record<string, PendingEntry>
-  mentionPatterns?: string[]
-  /** Emoji short name to react with on receipt. e.g. "eyes". Empty string disables. */
-  ackReaction?: string
-  /** Which chunks get threading when reply_to/thread_id is passed. Default: 'first'. 'off' = no threading. */
-  replyToMode?: 'off' | 'first' | 'all'
-  /** Max chars per outbound message before splitting. Default: 16383 (Mattermost default max). */
-  textChunkLimit?: number
-  /** Split on paragraph boundaries instead of hard char count. */
-  chunkMode?: 'length' | 'newline'
-}
-
-type GateResult =
-  | { action: 'deliver'; access: Access }
-  | { action: 'drop' }
-  | { action: 'pair'; code: string; isResend: boolean }
-
-// ── Access file management ─────────────────────────────────────────────────
-
-function defaultAccess(): Access {
-  return { dmPolicy: 'pairing', allowFrom: [], groups: {}, pending: {} }
-}
-
-const MAX_CHUNK_LIMIT = 16383
-const MAX_ATTACHMENT_BYTES = 50 * 1024 * 1024
-
-function assertSendable(f: string): void {
-  let real, stateReal: string
-  try {
-    real = realpathSync(f)
-    stateReal = realpathSync(STATE_DIR)
-  } catch { return }
-  const inbox = join(stateReal, 'inbox')
-  if (real.startsWith(stateReal + sep) && !real.startsWith(inbox + sep)) {
-    throw new Error(`refusing to send channel state: ${f}`)
-  }
-}
-
-function readAccessFile(): Access {
-  try {
-    const raw = readFileSync(ACCESS_FILE, 'utf8')
-    const parsed = JSON.parse(raw) as Partial<Access>
-    return {
-      dmPolicy: parsed.dmPolicy ?? 'pairing',
-      allowFrom: parsed.allowFrom ?? [],
-      groups: parsed.groups ?? {},
-      pending: parsed.pending ?? {},
-      mentionPatterns: parsed.mentionPatterns,
-      ackReaction: parsed.ackReaction,
-      replyToMode: parsed.replyToMode,
-      textChunkLimit: parsed.textChunkLimit,
-      chunkMode: parsed.chunkMode,
-    }
-  } catch (err) {
-    if ((err as NodeJS.ErrnoException).code === 'ENOENT') return defaultAccess()
-    try { renameSync(ACCESS_FILE, `${ACCESS_FILE}.corrupt-${Date.now()}`) } catch {}
-    process.stderr.write('mattermost: access.json is corrupt, moved aside. Starting fresh.\n')
-    return defaultAccess()
-  }
-}
-
-// ── Per-chat notes (channel-scoped memory) ────────────────────────────────
-
-type NoteEntry = { content: string; ts: string }
-type NotesFile = { notes: Record<string, NoteEntry> }
-
-function notesPath(chatId: string): string {
-  return join(MEMORY_DIR, `${chatId.replace(/[^a-zA-Z0-9_-]/g, '_')}.json`)
-}
-
-function readNotes(chatId: string): Record<string, NoteEntry> {
-  try {
-    const raw = readFileSync(notesPath(chatId), 'utf8')
-    const parsed = JSON.parse(raw) as NotesFile
-    return parsed.notes ?? {}
-  } catch {
-    return {}
-  }
-}
-
-function writeNotes(chatId: string, notes: Record<string, NoteEntry>): void {
-  mkdirSync(MEMORY_DIR, { recursive: true })
-  const p = notesPath(chatId)
-  const tmp = `${p}.tmp-${Date.now()}`
-  writeFileSync(tmp, JSON.stringify({ notes } as NotesFile, null, 2))
-  chmodSync(tmp, 0o600)
-  renameSync(tmp, p)
-}
-
-function formatNotesPrefix(chatId: string): string {
-  const notes = readNotes(chatId)
-  const keys = Object.keys(notes)
-  if (keys.length === 0) return ''
-  const lines = keys.map(k => `${k}: ${notes[k].content}`)
-  return `[notes for this chat]\n${lines.join('\n')}\n[/notes]\n\n`
-}
-
-// ── Per-chat mode (plan mode) ──────────────────────────────────────────────
-
-type ChatMode = { mode: 'plan'; since: string }
-
-function modePath(chatId: string): string {
-  return join(MODES_DIR, `${chatId.replace(/[^a-zA-Z0-9_-]/g, '_')}.json`)
-}
-
-function readMode(chatId: string): ChatMode | null {
-  try {
-    return JSON.parse(readFileSync(modePath(chatId), 'utf8'))
-  } catch { return null }
-}
-
-function writeMode(chatId: string, m: ChatMode): void {
-  mkdirSync(MODES_DIR, { recursive: true })
-  const p = modePath(chatId)
-  const tmp = `${p}.tmp-${Date.now()}`
-  writeFileSync(tmp, JSON.stringify(m))
-  chmodSync(tmp, 0o600)
-  renameSync(tmp, p)
-}
-
-function clearMode(chatId: string): void {
-  try { unlinkSync(modePath(chatId)) } catch {}
-}
+const mm: MmClient = createMmClient(
+  MATTERMOST_URL?.replace(/\/+$/, '') ?? '',
+  MATTERMOST_TOKEN ?? '',
+)
 
 // ── Static mode ────────────────────────────────────────────────────────────
 
@@ -263,23 +94,11 @@ function loadAccess(): Access {
 
 function saveAccess(a: Access): void {
   if (STATIC) return
-  mkdirSync(STATE_DIR, { recursive: true, mode: 0o700 })
-  const tmp = ACCESS_FILE + '.tmp'
-  writeFileSync(tmp, JSON.stringify(a, null, 2) + '\n', { mode: 0o600 })
-  renameSync(tmp, ACCESS_FILE)
+  sharedSaveAccess(a)
 }
 
-function pruneExpired(a: Access): boolean {
-  const now = Date.now()
-  let changed = false
-  for (const [code, p] of Object.entries(a.pending)) {
-    if (p.expiresAt < now) {
-      delete a.pending[code]
-      changed = true
-    }
-  }
-  return changed
-}
+/** AccessOps for gate() — bridges process-local BOOT_ACCESS/STATIC mode. */
+const accessOps: AccessOps = { load: loadAccess, save: saveAccess }
 
 // ── Recent sent IDs (LRU for mention detection) ───────────────────────────
 
@@ -294,82 +113,10 @@ function noteSent(id: string): void {
   }
 }
 
-// ── Gate ────────────────────────────────────────────────────────────────────
-
-async function gate(post: any, channelType: string): Promise<GateResult> {
-  const access = loadAccess()
-  const pruned = pruneExpired(access)
-  if (pruned) saveAccess(access)
-
-  if (access.dmPolicy === 'disabled') return { action: 'drop' }
-
-  const senderId = post.user_id as string
-  const isDM = channelType === 'D'
-
-  if (isDM) {
-    if (access.allowFrom.includes(senderId)) return { action: 'deliver', access }
-    if (access.dmPolicy === 'allowlist') return { action: 'drop' }
-
-    // pairing mode — check for existing non-expired code for this sender
-    for (const [code, p] of Object.entries(access.pending)) {
-      if (p.senderId === senderId) {
-        if ((p.replies ?? 1) >= 2) return { action: 'drop' }
-        p.replies = (p.replies ?? 1) + 1
-        saveAccess(access)
-        return { action: 'pair', code, isResend: true }
-      }
-    }
-    if (Object.keys(access.pending).length >= 3) return { action: 'drop' }
-
-    const code = randomBytes(3).toString('hex')
-    const now = Date.now()
-    access.pending[code] = {
-      senderId,
-      chatId: post.channel_id, // DM channel ID — used later to confirm approval
-      createdAt: now,
-      expiresAt: now + 60 * 60 * 1000, // 1h
-      replies: 1,
-    }
-    saveAccess(access)
-    return { action: 'pair', code, isResend: false }
-  }
-
-  // Channel messages (O = public, P = private, G = group DM)
-  const channelId = post.channel_id as string
-  const policy = access.groups[channelId]
-  if (!policy) return { action: 'drop' }
-  const groupAllowFrom = policy.allowFrom ?? []
-  const requireMention = policy.requireMention ?? true
-  if (groupAllowFrom.length > 0 && !groupAllowFrom.includes(senderId)) {
-    return { action: 'drop' }
-  }
-  if (requireMention && !isMentioned(post, access.mentionPatterns)) {
-    return { action: 'drop' }
-  }
-  return { action: 'deliver', access }
-}
-
-// ── Mention detection (plain text — no structured @mentions in Mattermost) ─
-
-function isMentioned(post: any, extraPatterns?: string[]): boolean {
-  const text = (post.message ?? '') as string
-
-  // 1. Plain text @botUsername mention
-  if (mm.botUsername && text.toLowerCase().includes(`@${mm.botUsername.toLowerCase()}`)) {
-    return true
-  }
-
-  // 2. Reply to one of our messages — thread root_id is in the sent set
-  if (post.root_id && recentSentIds.has(post.root_id)) return true
-
-  // 3. Custom regex patterns from access.json
-  for (const pat of extraPatterns ?? []) {
-    try {
-      if (new RegExp(pat, 'i').test(text)) return true
-    } catch {}
-  }
-  return false
-}
+// ── Gate (delegates to shared gate with local access ops) ──────────────────
+// gate() is imported from shared.ts and called with accessOps.
+// isMentioned() is imported from shared.ts.
+// For legacy mode, the full mention check uses process-local botUsername and recentSentIds.
 
 // ── Approval polling ───────────────────────────────────────────────────────
 // The /mattermost:access skill writes approved/<senderId> (contents = chatId).
@@ -412,34 +159,20 @@ function checkApprovals(): void {
   }
 }
 
-if (!STATIC) setInterval(checkApprovals, 5000).unref()
-
-// ── Chunking ───────────────────────────────────────────────────────────────
-
-function chunk(text: string, limit: number, mode: 'length' | 'newline'): string[] {
-  if (text.length <= limit) return [text]
-  const out: string[] = []
-  let rest = text
-  while (rest.length > limit) {
-    let cut = limit
-    if (mode === 'newline') {
-      const para = rest.lastIndexOf('\n\n', limit)
-      const line = rest.lastIndexOf('\n', limit)
-      const space = rest.lastIndexOf(' ', limit)
-      cut = para > limit / 2 ? para : line > limit / 2 ? line : space > 0 ? space : limit
-    }
-    out.push(rest.slice(0, cut))
-    rest = rest.slice(cut).replace(/^\n+/, '')
-  }
-  if (rest) out.push(rest)
-  return out
-}
+if (!STATIC && !CHANNEL_SCOPE) setInterval(checkApprovals, 5000).unref()
 
 // ── DM channel cache + outbound gate ───────────────────────────────────────
 
 const dmChannelToUser = new Map<string, string>()
 
 async function assertAllowedChannel(channelId: string): Promise<void> {
+  // In channel scope mode, only allow the scoped channel
+  if (CHANNEL_SCOPE) {
+    if (channelId !== CHANNEL_SCOPE) {
+      throw new Error(`channel ${channelId} is outside scope ${CHANNEL_SCOPE}`)
+    }
+    return
+  }
   const access = loadAccess()
   const dmUserId = dmChannelToUser.get(channelId)
   if (dmUserId) {
@@ -448,12 +181,6 @@ async function assertAllowedChannel(channelId: string): Promise<void> {
   }
   if (channelId in access.groups) return
   throw new Error(`channel ${channelId} is not allowlisted — add via /mattermost:access`)
-}
-
-// ── Attachment helpers ─────────────────────────────────────────────────────
-
-function safeAttName(info: any): string {
-  return (info.name ?? info.id ?? 'file').replace(/[\[\]\r\n;]/g, '_')
 }
 
 // ── MCP server ─────────────────────────────────────────────────────────────
@@ -871,7 +598,8 @@ function connectWebSocket(): void {
 // ── Inbound message handling ───────────────────────────────────────────────
 
 async function handleInbound(post: any, channelType: string, senderName: string): Promise<void> {
-  const result = await gate(post, channelType)
+  const mentionCtx: MentionContext = { botUsername: mm.botUsername, sentIds: recentSentIds }
+  const result = await gate(post, channelType, accessOps, mentionCtx)
 
   if (result.action === 'drop') return
 
@@ -1006,19 +734,180 @@ async function handleInbound(post: any, channelType: string, senderName: string)
   })
 }
 
+// ── Inbox watcher (channel scope mode) ──────────────────────────────────
+
+function startInboxWatcher(): void {
+  if (!SESSION_DIR || !CHANNEL_SCOPE) return
+
+  const inboxDir = join(SESSION_DIR, 'inbox')
+  mkdirSync(inboxDir, { recursive: true })
+
+  const processed = new Set<string>()
+
+  function processInbox(): void {
+    let files: string[]
+    try {
+      files = readdirSync(inboxDir).filter(f => f.endsWith('.json')).sort()
+    } catch { return }
+
+    for (const filename of files) {
+      if (processed.has(filename)) continue
+      const filePath = join(inboxDir, filename)
+      const processingPath = filePath + '.processing'
+
+      try {
+        // Atomic claim: rename to .processing
+        renameSync(filePath, processingPath)
+      } catch {
+        continue // another process or already processed
+      }
+
+      try {
+        const raw = readFileSync(processingPath, 'utf8')
+        const msg = JSON.parse(raw) as InboxMessage
+        deliverInboxMessage(msg)
+        unlinkSync(processingPath)
+        processed.add(filename)
+      } catch (err) {
+        process.stderr.write(`mattermost channel: inbox processing error: ${err}\n`)
+        // Leave .processing file for retry on next poll
+      }
+    }
+
+    // Also retry any leftover .processing files
+    try {
+      const retries = readdirSync(inboxDir).filter(f => f.endsWith('.processing'))
+      for (const filename of retries) {
+        const filePath = join(inboxDir, filename)
+        try {
+          const raw = readFileSync(filePath, 'utf8')
+          const msg = JSON.parse(raw) as InboxMessage
+          deliverInboxMessage(msg)
+          unlinkSync(filePath)
+        } catch {}
+      }
+    } catch {}
+
+    // Cap dedup set
+    if (processed.size > 1000) {
+      const arr = [...processed]
+      for (let i = 0; i < arr.length - 500; i++) processed.delete(arr[i])
+    }
+  }
+
+  function deliverInboxMessage(msg: InboxMessage): void {
+    const chatId = msg.channelId
+
+    // Plan mode handling (modeCommand set by router)
+    let modePrefix = ''
+    let effectiveMessage = msg.message
+
+    if (msg.modeCommand === 'plan') {
+      writeMode(chatId, { mode: 'plan', since: new Date().toISOString() })
+      effectiveMessage = msg.modeExtra?.trim() || '(plan mode activated — awaiting request)'
+      modePrefix = [
+        '[mode: plan]',
+        'PLAN MODE is active. Research, explore, and think — but do NOT execute code changes',
+        '(no Edit, Write, or destructive Bash commands).',
+        'If anything is unclear, ask the user questions — they can reply normally while plan mode stays active.',
+        'When ready, present your plan clearly with:',
+        '1. What you will change and why',
+        '2. Files involved',
+        '3. Step-by-step approach',
+        'The user will review and type !go to approve execution, or !cancel to abort.',
+        '[/mode]',
+        '',
+      ].join('\n')
+    } else if (msg.modeCommand === 'go') {
+      clearMode(chatId)
+      const extra = msg.modeExtra?.trim() ?? ''
+      modePrefix = [
+        '[mode: plan-approved]',
+        'The user approved the plan. Execute the plan you previously presented.',
+        ...(extra ? [`Additional context: ${extra}`] : []),
+        '[/mode]',
+        '',
+      ].join('\n')
+      effectiveMessage = extra || '(execute the plan)'
+    } else if (msg.modeCommand === 'cancel') {
+      clearMode(chatId)
+      effectiveMessage = msg.modeExtra?.trim() || '(plan cancelled)'
+      modePrefix = [
+        '[mode: plan-cancelled]',
+        'The user cancelled the plan. Do not execute any changes. Acknowledge the cancellation.',
+        '[/mode]',
+        '',
+      ].join('\n')
+    } else {
+      const currentMode = readMode(chatId)
+      if (currentMode?.mode === 'plan') {
+        modePrefix = [
+          '[mode: plan]',
+          'PLAN MODE is still active. Continue planning — do NOT execute code changes.',
+          'You may ask follow-up questions if needed.',
+          'The user will type !go to approve execution, or !cancel to abort.',
+          '[/mode]',
+          '',
+        ].join('\n')
+      }
+    }
+
+    const atts = msg.attachments ?? []
+    const attsStr = atts.map(a => `${a.name} (${a.mimeType}, ${a.sizeKB}KB)`).join('; ')
+    const rawContent = effectiveMessage || (atts.length > 0 ? '(attachment)' : '')
+    const content = modePrefix + formatNotesPrefix(chatId) + rawContent
+
+    mcp.notification({
+      method: 'notifications/claude/channel',
+      params: {
+        content,
+        meta: {
+          chat_id: chatId,
+          message_id: msg.postId,
+          user: msg.userName || msg.userId,
+          user_id: msg.userId,
+          ts: new Date(msg.createAt).toISOString(),
+          ...(msg.rootId ? { thread_id: msg.rootId } : {}),
+          ...(atts.length > 0 ? { attachment_count: String(atts.length), attachments: attsStr } : {}),
+        },
+      },
+    }).catch(err => {
+      process.stderr.write(`mattermost channel: failed to deliver inbox message to Claude: ${err}\n`)
+    })
+  }
+
+  // Hybrid: fs.watch as trigger + polling as backup
+  watch(inboxDir, () => { processInbox() })
+  setInterval(processInbox, 500).unref()
+
+  // Initial scan for any messages that arrived before watcher started
+  processInbox()
+
+  // Write ready signal
+  const readyFile = join(SESSION_DIR, 'ready')
+  writeFileSync(readyFile, String(Date.now()))
+
+  process.stderr.write(`mattermost channel: inbox watcher started (scope: ${CHANNEL_SCOPE})\n`)
+}
+
 // ── Main init ──────────────────────────────────────────────────────────────
 
 if (MATTERMOST_URL && MATTERMOST_TOKEN) {
-  mm.url = MATTERMOST_URL.replace(/\/+$/, '')
-  mm.token = MATTERMOST_TOKEN
-
   void (async () => {
     try {
       const me = await mm.get('/users/me')
       mm.botUserId = me.id
       mm.botUsername = me.username
       process.stderr.write(`mattermost channel: authenticated as @${mm.botUsername}\n`)
-      connectWebSocket()
+
+      if (CHANNEL_SCOPE) {
+        // Channel scope mode: inbox watcher, no WebSocket
+        process.stderr.write(`mattermost channel: channel scope mode (${CHANNEL_SCOPE})\n`)
+        startInboxWatcher()
+      } else {
+        // Legacy mode: WebSocket + all channels
+        connectWebSocket()
+      }
     } catch (err) {
       process.stderr.write(`mattermost channel: auth failed: ${err}\n`)
     }

@@ -15,7 +15,8 @@ An MCP server that connects Mattermost to Claude Code — send and receive messa
 - **Multi-layer access control** — pairing codes, allowlists, per-channel gating, and static mode
 - **Plan mode** — `!plan` / `!go` / `!cancel` workflow for review-before-execute
 - **Per-chat notes** — channel-scoped context persistence across sessions
-- **Zero build step** — runs directly with Bun, single TypeScript file
+- **Multi-channel router** — optional daemon that spawns isolated Claude instances per channel
+- **Zero build step** — runs directly with Bun, no compilation required
 
 ## Prerequisites
 
@@ -189,6 +190,26 @@ Claude will research and present a plan without making changes. Then:
 
 Plan mode persists until `!go` or `!cancel`. Regular messages continue the planning conversation.
 
+## Router Mode
+
+By default, the server handles all channels in a single Claude session. **Router mode** spawns a separate Claude instance per channel for full isolation:
+
+```sh
+bun run router
+```
+
+Each channel gets its own working directory under `~/.claude/channels/mattermost/sessions/<channelId>/` with independent notes, inbox, and logs.
+
+The router connects to the Mattermost WebSocket, detects which channel an inbound message belongs to, and routes it to the corresponding Claude process (spawning one on demand if needed).
+
+### Environment Variables (Router)
+
+| Variable | Description |
+|----------|-------------|
+| `MATTERMOST_URL` | Mattermost server URL (same as single mode) |
+| `MATTERMOST_TOKEN` | Bot access token (same as single mode) |
+| `MATTERMOST_STATE_DIR` | Base state directory (default: `~/.claude/channels/mattermost/`) |
+
 ## Self-Hosted Notes
 
 - The bot needs `post:all` and `post:channels` permissions (or system admin)
@@ -217,7 +238,11 @@ This project implements multiple layers of defense:
 
 ## Contributing
 
-The server is a single TypeScript file (`server.ts`) running on Bun with one dependency (`@modelcontextprotocol/sdk`).
+The codebase is three TypeScript files running on Bun with one dependency (`@modelcontextprotocol/sdk`):
+
+- `server.ts` — MCP server (single-channel or channel-scoped mode)
+- `shared.ts` — shared types, constants, and utilities
+- `router.ts` — multi-channel coordinator daemon
 
 ```sh
 git clone https://github.com/hayan89/claude-channel-mattermost.git
