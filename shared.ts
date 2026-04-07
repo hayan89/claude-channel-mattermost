@@ -8,7 +8,7 @@
 
 import { randomBytes } from 'crypto'
 import {
-  readFileSync, writeFileSync, mkdirSync,
+  readFileSync, writeFileSync, mkdirSync, appendFileSync,
   renameSync, realpathSync, chmodSync, unlinkSync,
   rmdirSync, statSync,
 } from 'fs'
@@ -44,6 +44,60 @@ export function loadEnvFile(): void {
     }
   } catch {}
 }
+
+// ── Logger ────────────────────────────────────────────────────────────────
+
+type LogLevel = 'DEBUG' | 'INFO' | 'ERROR'
+
+const LEVEL_NUM: Record<LogLevel, number> = { DEBUG: 0, INFO: 1, ERROR: 2 }
+const LEVEL_PAD: Record<LogLevel, string> = { DEBUG: 'DEBUG', INFO: 'INFO ', ERROR: 'ERROR' }
+
+export type Logger = {
+  debug(msg: string): void
+  info(msg: string): void
+  error(msg: string): void
+  child(subPrefix: string): Logger
+}
+
+export type LoggerOptions = {
+  /** Also write to a file (e.g. trigger.ts log) */
+  filePath?: string
+  /** Max file size in bytes before truncation (default: 1_000_000) */
+  maxFileBytes?: number
+  /** Lines to keep when truncating (default: 500) */
+  keepLines?: number
+}
+
+function writeToFile(line: string, opts: LoggerOptions): void {
+  const { filePath, maxFileBytes = 1_000_000, keepLines = 500 } = opts
+  if (!filePath) return
+  appendFileSync(filePath, line)
+  try {
+    if (statSync(filePath).size > maxFileBytes) {
+      const content = readFileSync(filePath, 'utf8')
+      const lines = content.split('\n').slice(-keepLines)
+      writeFileSync(filePath, lines.join('\n') + '\n')
+    }
+  } catch {}
+}
+
+export function createLogger(prefix: string, opts?: LoggerOptions): Logger {
+  function emit(level: LogLevel, msg: string): void {
+    const cur = LEVEL_NUM[(process.env.LOG_LEVEL as LogLevel)] ?? LEVEL_NUM.INFO
+    if (LEVEL_NUM[level] < cur) return
+    const line = `${new Date().toISOString()} ${LEVEL_PAD[level]} [${prefix}] ${msg}\n`
+    process.stderr.write(line)
+    if (opts?.filePath) writeToFile(line, opts)
+  }
+  return {
+    debug(msg: string) { emit('DEBUG', msg) },
+    info(msg: string) { emit('INFO', msg) },
+    error(msg: string) { emit('ERROR', msg) },
+    child(subPrefix: string) { return createLogger(`${prefix}.${subPrefix}`, opts) },
+  }
+}
+
+const sharedLog = createLogger('shared')
 
 // ── Types ──────────────────────────────────────────────────────────────────
 
@@ -188,7 +242,7 @@ export function readAccessFile(): Access {
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === 'ENOENT') return defaultAccess()
     try { renameSync(ACCESS_FILE, `${ACCESS_FILE}.corrupt-${Date.now()}`) } catch {}
-    process.stderr.write('mattermost: access.json is corrupt, moved aside. Starting fresh.\n')
+    sharedLog.error('access.json is corrupt, moved aside. Starting fresh.')
     return defaultAccess()
   }
 }

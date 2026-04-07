@@ -5,10 +5,10 @@
  * server/router flow picks it up as a scheduled message.
  */
 
-import { appendFileSync, readFileSync, statSync, writeFileSync } from 'fs'
 import { join } from 'path'
 import {
   SCHEDULES_DIR,
+  createLogger,
   loadEnvFile,
   readSchedules,
   removeCrontabEntry,
@@ -34,26 +34,10 @@ if (!scheduleId || !channelId) {
   process.exit(1)
 }
 
-// ── Log helper ────────────────────────────────────────────────────────────
+// ── Logger ────────────────────────────────────────────────────────────────
 
 const logPath = join(SCHEDULES_DIR, 'trigger.log')
-
-function log(message: string): void {
-  const ts = new Date().toISOString()
-  const line = `[${ts}] ${message}\n`
-  try {
-    appendFileSync(logPath, line)
-    // Truncate if over 1MB: keep last 500 lines
-    try {
-      const st = statSync(logPath)
-      if (st.size > 1_000_000) {
-        const content = readFileSync(logPath, 'utf8')
-        const lines = content.split('\n')
-        writeFileSync(logPath, lines.slice(-500).join('\n'))
-      }
-    } catch {}
-  } catch {}
-}
+const log = createLogger('trigger', { filePath: logPath, maxFileBytes: 1_000_000, keepLines: 500 })
 
 // ── Main ──────────────────────────────────────────────────────────────────
 
@@ -63,7 +47,7 @@ const url = process.env.MATTERMOST_URL
 const token = process.env.MATTERMOST_TOKEN
 
 if (!url || !token) {
-  log(`ERROR schedule=${scheduleId} channel=${channelId}: MATTERMOST_URL or MATTERMOST_TOKEN not set`)
+  log.error(`schedule=${scheduleId} channel=${channelId}: MATTERMOST_URL or MATTERMOST_TOKEN not set`)
   process.exit(1)
 }
 
@@ -73,7 +57,7 @@ const entry = schedules.find(s => s.id === scheduleId)
 
 if (!entry) {
   // Schedule was deleted — remove ourselves from crontab
-  log(`CLEANUP schedule=${scheduleId} channel=${channelId}: schedule not found, removing crontab entry`)
+  log.info(`schedule=${scheduleId} channel=${channelId}: schedule not found, removing crontab entry`)
   try { removeCrontabEntry(scheduleId) } catch {}
   process.exit(0)
 }
@@ -93,13 +77,13 @@ try {
   })
 
   if (res.ok) {
-    log(`OK schedule=${scheduleId} channel=${channelId}: posted (status ${res.status})`)
+    log.info(`schedule=${scheduleId} channel=${channelId}: posted (status ${res.status})`)
     process.exit(0)
   } else {
-    log(`ERROR schedule=${scheduleId} channel=${channelId}: HTTP ${res.status}`)
+    log.error(`schedule=${scheduleId} channel=${channelId}: HTTP ${res.status}`)
     process.exit(1)
   }
 } catch (err) {
-  log(`ERROR schedule=${scheduleId} channel=${channelId}: ${(err as Error).message}`)
+  log.error(`schedule=${scheduleId} channel=${channelId}: ${(err as Error).message}`)
   process.exit(1)
 }

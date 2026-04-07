@@ -20,7 +20,7 @@ import {
   STATE_DIR, APPROVED_DIR,
   SCHEDULED_RE,
   type MmClient, type MentionContext, type InboxMessage,
-  loadEnvFile, createMmClient,
+  loadEnvFile, createMmClient, createLogger,
   readAccessFile, saveAccess,
   gate, safeAttName,
   type AccessOps,
@@ -37,20 +37,20 @@ const MAX_SESSIONS = parseInt(process.env.MATTERMOST_MAX_SESSIONS ?? '10')
 const IDLE_TIMEOUT_MS = parseInt(process.env.MATTERMOST_IDLE_TIMEOUT ?? String(30 * 60 * 1000))
 const SESSIONS_DIR = join(STATE_DIR, 'sessions')
 
+const log = createLogger('router')
+
 if (!MATTERMOST_URL || !MATTERMOST_TOKEN) {
-  process.stderr.write(
-    `mattermost router: MATTERMOST_URL and MATTERMOST_TOKEN required\n`,
-  )
+  log.error('MATTERMOST_URL and MATTERMOST_TOKEN required')
   process.exit(1)
 }
 
 // ── Error handlers ─────────────────────────────────────────────────────────
 
 process.on('unhandledRejection', err => {
-  process.stderr.write(`mattermost router: unhandled rejection: ${err}\n`)
+  log.error(`unhandled rejection: ${err}`)
 })
 process.on('uncaughtException', err => {
-  process.stderr.write(`mattermost router: uncaught exception: ${err}\n`)
+  log.error(`uncaught exception: ${err}`)
 })
 
 // ── Mattermost REST client ─────────────────────────────────────────────────
@@ -106,7 +106,7 @@ function createSession(channelId: string): ChannelSession {
   }
   sessions.set(channelId, session)
 
-  process.stderr.write(`router: spawning Claude for channel ${channelId}\n`)
+  log.info(`spawning Claude for channel ${channelId}`)
 
   const stdoutLog = join(sessionDir, 'claude.stdout.log')
   const stderrLog = join(sessionDir, 'claude.stderr.log')
@@ -148,7 +148,7 @@ function createSession(channelId: string): ChannelSession {
 
   // Process exit detection
   proc.exited.then(code => {
-    process.stderr.write(`router: channel ${channelId} claude exited (code ${code})\n`)
+    log.info(`channel ${channelId} claude exited (code ${code})`)
     if (sessions.get(channelId) === session) {
       sessions.delete(channelId)
     }
@@ -181,7 +181,7 @@ function watchForReady(session: ChannelSession): void {
   const readyFile = join(session.sessionDir, 'ready')
   const timeout = setTimeout(() => {
     if (session.state === 'starting') {
-      process.stderr.write(`router: channel ${session.channelId} startup timeout (30s)\n`)
+      log.error(`channel ${session.channelId} startup timeout (30s)`)
       stopSession(session.channelId)
     }
   }, 30_000)
@@ -193,7 +193,7 @@ function watchForReady(session: ChannelSession): void {
       clearTimeout(timeout)
       clearInterval(check)
       session.state = 'ready'
-      process.stderr.write(`router: channel ${session.channelId} ready\n`)
+      log.info(`channel ${session.channelId} ready`)
 
       // Flush queued messages
       for (const msg of session.messageQueue) {
@@ -218,7 +218,7 @@ function stopSession(channelId: string): void {
   session.state = 'stopping'
 
   if (session.claudeProcess) {
-    process.stderr.write(`router: stopping channel ${channelId}\n`)
+    log.info(`stopping channel ${channelId}`)
     session.claudeProcess.kill('SIGTERM')
 
     // Force kill after 5s
@@ -240,10 +240,10 @@ function ensureSession(channelId: string): ChannelSession {
       .filter(([, s]) => s.state === 'ready')
       .sort((a, b) => a[1].lastActivity - b[1].lastActivity)
     if (idle.length > 0) {
-      process.stderr.write(`router: evicting idle session for channel ${idle[0][0]}\n`)
+      log.info(`evicting idle session for channel ${idle[0][0]}`)
       stopSession(idle[0][0])
     } else {
-      process.stderr.write(`router: max sessions (${MAX_SESSIONS}) reached, all active\n`)
+      log.error(`max sessions (${MAX_SESSIONS}) reached, all active`)
       // Still try to create — it'll work if a session finished between the check
     }
   }
@@ -279,7 +279,7 @@ setInterval(() => {
   const now = Date.now()
   for (const [channelId, session] of sessions) {
     if (session.state === 'ready' && now - session.lastActivity > IDLE_TIMEOUT_MS) {
-      process.stderr.write(`router: idle timeout for channel ${channelId}\n`)
+      log.info(`idle timeout for channel ${channelId}`)
       stopSession(channelId)
     }
   }
@@ -315,9 +315,9 @@ function checkApprovals(): void {
           message: 'Paired! Say hi to Claude.',
         })
         rmSync(file, { force: true })
-        process.stderr.write(`router: approved ${senderId}\n`)
+        log.debug(`approved ${senderId}`)
       } catch (err) {
-        process.stderr.write(`router: failed to send approval confirm: ${err}\n`)
+        log.error(`failed to send approval confirm: ${err}`)
         rmSync(file, { force: true })
       }
     })()
@@ -345,7 +345,7 @@ function connectWebSocket(): void {
       action: 'authentication_challenge',
       data: { token: mm.token },
     }))
-    process.stderr.write('router: websocket connected\n')
+    log.info('websocket connected')
   })
 
   ws.addEventListener('message', (event: MessageEvent) => {
@@ -390,20 +390,20 @@ function connectWebSocket(): void {
       const channelType = data.data.channel_type ?? ''
       const senderName = data.data.sender_name ?? ''
       handleInbound(post, channelType, senderName).catch(e =>
-        process.stderr.write(`router: handleInbound failed: ${e}\n`),
+        log.error(`handleInbound failed: ${e}`),
       )
     }
   })
 
   ws.addEventListener('close', () => {
     if (shuttingDown) return
-    process.stderr.write(`router: ws closed, reconnecting in ${reconnectDelay / 1000}s\n`)
+    log.info(`ws closed, reconnecting in ${reconnectDelay / 1000}s`)
     setTimeout(connectWebSocket, reconnectDelay)
     reconnectDelay = Math.min(reconnectDelay * 2, 60000)
   })
 
   ws.addEventListener('error', () => {
-    process.stderr.write('router: ws error\n')
+    log.error('ws error')
   })
 }
 
@@ -423,7 +423,7 @@ async function handleInbound(post: any, channelType: string, senderName: string)
         message: `${lead} — run in Claude Code:\n\n\`/mattermost:access pair ${result.code}\``,
       })
     } catch (err) {
-      process.stderr.write(`router: failed to send pairing code: ${err}\n`)
+      log.error(`failed to send pairing code: ${err}`)
     }
     return
   }
@@ -516,7 +516,7 @@ async function handleInbound(post: any, channelType: string, senderName: string)
 function shutdown(): void {
   if (shuttingDown) return
   shuttingDown = true
-  process.stderr.write('router: shutting down\n')
+  log.info('shutting down')
 
   // Close WebSocket
   if (ws) {
@@ -530,7 +530,7 @@ function shutdown(): void {
 
   // Force exit after 7s (5s SIGTERM wait + 2s buffer)
   setTimeout(() => {
-    process.stderr.write('router: force exit\n')
+    log.info('force exit')
     process.exit(0)
   }, 7000)
 }
@@ -547,11 +547,11 @@ void (async () => {
     const me = await mm.get('/users/me')
     mm.botUserId = me.id
     mm.botUsername = me.username
-    process.stderr.write(`router: authenticated as @${mm.botUsername}\n`)
-    process.stderr.write(`router: max sessions=${MAX_SESSIONS}, idle timeout=${IDLE_TIMEOUT_MS / 1000}s\n`)
+    log.info(`authenticated as @${mm.botUsername}`)
+    log.info(`max sessions=${MAX_SESSIONS}, idle timeout=${IDLE_TIMEOUT_MS / 1000}s`)
     connectWebSocket()
   } catch (err) {
-    process.stderr.write(`router: auth failed: ${err}\n`)
+    log.error(`auth failed: ${err}`)
     process.exit(1)
   }
 })()

@@ -31,7 +31,7 @@ import {
   MAX_SCHEDULES_PER_CHANNEL, SCHEDULED_RE,
   type Access, type MmClient, type AccessOps, type MentionContext, type InboxMessage,
   type ScheduleEntry,
-  loadEnvFile, createMmClient,
+  loadEnvFile, createMmClient, createLogger,
   readAccessFile, saveAccess as sharedSaveAccess,
   gate,
   chunk, assertSendable, safeAttName,
@@ -51,9 +51,11 @@ const STATIC = process.env.MATTERMOST_ACCESS_MODE === 'static'
 const CHANNEL_SCOPE = process.env.MATTERMOST_CHANNEL_SCOPE
 const SESSION_DIR = process.env.MATTERMOST_SESSION_DIR
 
+const log = createLogger('server')
+
 if (!MATTERMOST_URL || !MATTERMOST_TOKEN) {
-  process.stderr.write(
-    `mattermost channel: MATTERMOST_URL and MATTERMOST_TOKEN required\n` +
+  log.error(
+    `MATTERMOST_URL and MATTERMOST_TOKEN required\n` +
     `  set in ${ENV_FILE}\n` +
     `  format: MATTERMOST_URL=https://your.server.com\n` +
     `          MATTERMOST_TOKEN=abc123...\n`,
@@ -63,10 +65,10 @@ if (!MATTERMOST_URL || !MATTERMOST_TOKEN) {
 // ── Error handlers ─────────────────────────────────────────────────────────
 
 process.on('unhandledRejection', err => {
-  process.stderr.write(`mattermost channel: unhandled rejection: ${err}\n`)
+  log.error(`unhandled rejection: ${err}`)
 })
 process.on('uncaughtException', err => {
-  process.stderr.write(`mattermost channel: uncaught exception: ${err}\n`)
+  log.error(`uncaught exception: ${err}`)
 })
 
 // ── Mattermost REST client ─────────────────────────────────────────────────
@@ -127,9 +129,7 @@ const BOOT_ACCESS: Access | null = STATIC
   ? (() => {
       const a = readAccessFile()
       if (a.dmPolicy === 'pairing') {
-        process.stderr.write(
-          'mattermost channel: static mode — dmPolicy "pairing" downgraded to "allowlist"\n',
-        )
+        log.info('static mode — dmPolicy "pairing" downgraded to "allowlist"')
         a.dmPolicy = 'allowlist'
       }
       a.pending = {}
@@ -199,9 +199,9 @@ function checkApprovals(): void {
           message: 'Paired! Say hi to Claude.',
         })
         rmSync(file, { force: true })
-        process.stderr.write(`mattermost: approved ${senderId}\n`)
+        log.debug(`approved ${senderId}`)
       } catch (err) {
-        process.stderr.write(`mattermost channel: failed to send approval confirm: ${err}\n`)
+        log.error(`failed to send approval confirm: ${err}`)
         rmSync(file, { force: true })
       }
     })()
@@ -732,7 +732,7 @@ let ws: WebSocket | null = null
 function shutdown(): void {
   if (shuttingDown) return
   shuttingDown = true
-  process.stderr.write('mattermost channel: shutting down\n')
+  log.info('shutting down')
   // Clean up heartbeats
   activeHeartbeats.forEach((_, id) => stopHeartbeat(id))
   // Delete status messages so they don't linger in Mattermost
@@ -767,7 +767,7 @@ function connectWebSocket(): void {
       action: 'authentication_challenge',
       data: { token: mm.token },
     }))
-    process.stderr.write('mattermost channel: websocket connected\n')
+    log.info('websocket connected')
   })
 
   ws.addEventListener('message', (event: MessageEvent) => {
@@ -790,7 +790,7 @@ function connectWebSocket(): void {
         const scheduleId = scheduledMatch[1]
         const actualPrompt = (post.message as string).replace(scheduledMatch[0], '')
         handleScheduledTrigger(post, scheduleId, actualPrompt).catch((e: unknown) =>
-          process.stderr.write(`mattermost: scheduled trigger failed: ${e}\n`),
+          log.error(`scheduled trigger failed: ${e}`),
         )
         return
       }
@@ -799,20 +799,20 @@ function connectWebSocket(): void {
       const channelType = data.data.channel_type ?? ''
       const senderName = data.data.sender_name ?? ''
       handleInbound(post, channelType, senderName).catch(e =>
-        process.stderr.write(`mattermost: handleInbound failed: ${e}\n`),
+        log.error(`handleInbound failed: ${e}`),
       )
     }
   })
 
   ws.addEventListener('close', () => {
     if (shuttingDown) return
-    process.stderr.write(`mattermost channel: ws closed, reconnecting in ${reconnectDelay / 1000}s\n`)
+    log.info(`ws closed, reconnecting in ${reconnectDelay / 1000}s`)
     setTimeout(connectWebSocket, reconnectDelay)
     reconnectDelay = Math.min(reconnectDelay * 2, 60000)
   })
 
   ws.addEventListener('error', (event: Event) => {
-    process.stderr.write(`mattermost channel: ws error\n`)
+    log.error('ws error')
   })
 }
 
@@ -848,7 +848,7 @@ async function handleScheduledTrigger(post: any, scheduleId: string, prompt: str
       },
     },
   }).catch((err: Error) => {
-    process.stderr.write(`mattermost channel: failed to deliver scheduled trigger: ${err}\n`)
+    log.error(`failed to deliver scheduled trigger: ${err}`)
   })
 }
 
@@ -866,7 +866,7 @@ async function handleInbound(post: any, channelType: string, senderName: string)
         message: `${lead} — run in Claude Code:\n\n\`/mattermost:access pair ${result.code}\``,
       })
     } catch (err) {
-      process.stderr.write(`mattermost channel: failed to send pairing code: ${err}\n`)
+      log.error(`failed to send pairing code: ${err}`)
     }
     return
   }
@@ -990,7 +990,7 @@ async function handleInbound(post: any, channelType: string, senderName: string)
       },
     },
   }).catch(err => {
-    process.stderr.write(`mattermost channel: failed to deliver inbound to Claude: ${err}\n`)
+    log.error(`failed to deliver inbound to Claude: ${err}`)
   })
 }
 
@@ -1029,7 +1029,7 @@ function startInboxWatcher(): void {
         unlinkSync(processingPath)
         processed.add(filename)
       } catch (err) {
-        process.stderr.write(`mattermost channel: inbox processing error: ${err}\n`)
+        log.error(`inbox processing error: ${err}`)
         // Leave .processing file for retry on next poll
       }
     }
@@ -1152,7 +1152,7 @@ function startInboxWatcher(): void {
         },
       },
     }).catch(err => {
-      process.stderr.write(`mattermost channel: failed to deliver inbox message to Claude: ${err}\n`)
+      log.error(`failed to deliver inbox message to Claude: ${err}`)
     })
   }
 
@@ -1167,7 +1167,7 @@ function startInboxWatcher(): void {
   const readyFile = join(SESSION_DIR, 'ready')
   writeFileSync(readyFile, String(Date.now()))
 
-  process.stderr.write(`mattermost channel: inbox watcher started (scope: ${CHANNEL_SCOPE})\n`)
+  log.info(`inbox watcher started (scope: ${CHANNEL_SCOPE})`)
 }
 
 // ── Main init ──────────────────────────────────────────────────────────────
@@ -1178,18 +1178,18 @@ if (MATTERMOST_URL && MATTERMOST_TOKEN) {
       const me = await mm.get('/users/me')
       mm.botUserId = me.id
       mm.botUsername = me.username
-      process.stderr.write(`mattermost channel: authenticated as @${mm.botUsername}\n`)
+      log.info(`authenticated as @${mm.botUsername}`)
 
       if (CHANNEL_SCOPE) {
         // Channel scope mode: inbox watcher, no WebSocket
-        process.stderr.write(`mattermost channel: channel scope mode (${CHANNEL_SCOPE})\n`)
+        log.info(`channel scope mode (${CHANNEL_SCOPE})`)
         startInboxWatcher()
       } else {
         // Legacy mode: WebSocket + all channels
         connectWebSocket()
       }
     } catch (err) {
-      process.stderr.write(`mattermost channel: auth failed: ${err}\n`)
+      log.error(`auth failed: ${err}`)
     }
   })()
 }
