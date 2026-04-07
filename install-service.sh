@@ -71,13 +71,12 @@ RestartSec=5
 
 # Environment
 Environment=HOME=${HOME}
-Environment=PATH=${HOME}/.bun/bin:/usr/local/bin:/usr/bin:/bin
+Environment=PATH=${HOME}/.local/bin:${HOME}/.bun/bin:/usr/local/bin:/usr/bin:/bin
 
 # Hardening
 NoNewPrivileges=true
 ProtectSystem=strict
-ProtectHome=read-only
-ReadWritePaths=${HOME}/.claude/channels/mattermost
+ReadWritePaths=${HOME}/.claude
 ReadWritePaths=/tmp
 
 # Logging
