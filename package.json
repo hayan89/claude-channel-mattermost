@@ -31,7 +31,9 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.0.0"
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "croner": "^9.0.0",
+    "playwright": "^1.59.1"
   },
   "devDependencies": {
     "bun-types": "latest",

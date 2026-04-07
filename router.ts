@@ -12,16 +12,17 @@
 
 import {
   readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync,
-  statSync, renameSync,
+  statSync, renameSync, watch,
 } from 'fs'
-import { join, resolve } from 'path'
+import { join, resolve, basename } from 'path'
+import { Cron } from 'croner'
 
 import {
-  STATE_DIR, APPROVED_DIR,
+  STATE_DIR, APPROVED_DIR, SCHEDULES_DIR,
   SCHEDULED_RE,
   type MmClient, type MentionContext, type InboxMessage,
   loadEnvFile, createMmClient, createLogger,
-  readAccessFile, saveAccess,
+  readAccessFile, saveAccess, readSchedules,
   gate, safeAttName,
   type AccessOps,
 } from './shared.js'
@@ -511,12 +512,91 @@ async function handleInbound(post: any, channelType: string, senderName: string)
   routeMessage(chatId, inboxMessage)
 }
 
+// ── App cron scheduler ────────────────────────────────────────────────────
+
+const cronJobs = new Map<string, Cron>()
+
+function channelIdFromPath(filename: string): string {
+  return basename(filename, '.json')
+}
+
+function loadAllSchedules(): void {
+  mkdirSync(SCHEDULES_DIR, { recursive: true })
+  let files: string[]
+  try {
+    files = readdirSync(SCHEDULES_DIR).filter(f => f.endsWith('.json'))
+  } catch { return }
+  for (const file of files) {
+    const channelId = channelIdFromPath(file)
+    reconcileChannel(channelId)
+  }
+}
+
+function reconcileChannel(channelId: string): void {
+  // Stop existing jobs for this channel
+  for (const [id, job] of cronJobs) {
+    if (id.startsWith(`${channelId}:`)) {
+      job.stop()
+      cronJobs.delete(id)
+    }
+  }
+
+  const schedules = readSchedules(channelId)
+  for (const entry of schedules) {
+    const key = `${channelId}:${entry.id}`
+    try {
+      const job = new Cron(entry.cron, () => {
+        fireSchedule(channelId, entry.id, entry.prompt).catch(err =>
+          log.error(`schedule trigger failed ${entry.id}: ${err}`),
+        )
+      })
+      cronJobs.set(key, job)
+      log.info(`loaded schedule ${entry.id} cron=${entry.cron}`)
+    } catch (err) {
+      log.error(`invalid cron for ${entry.id}: ${err}`)
+    }
+  }
+}
+
+async function fireSchedule(channelId: string, scheduleId: string, prompt: string): Promise<void> {
+  log.info(`firing schedule ${scheduleId} for channel ${channelId}`)
+  await mm.post('/posts', {
+    channel_id: channelId,
+    message: `[scheduled:${scheduleId}] ${prompt}`,
+  })
+}
+
+function stopAllJobs(): void {
+  for (const [, job] of cronJobs) {
+    job.stop()
+  }
+  cronJobs.clear()
+}
+
+// Watch schedules directory for changes (debounced)
+let watchDebounce: ReturnType<typeof setTimeout> | null = null
+function startScheduleWatcher(): void {
+  mkdirSync(SCHEDULES_DIR, { recursive: true })
+  watch(SCHEDULES_DIR, (_event, filename) => {
+    if (!filename || !filename.endsWith('.json')) return
+    if (watchDebounce) clearTimeout(watchDebounce)
+    watchDebounce = setTimeout(() => {
+      const channelId = channelIdFromPath(filename)
+      log.info(`schedule file changed: ${filename}, reconciling`)
+      reconcileChannel(channelId)
+    }, 200)
+  })
+}
+
 // ── Graceful shutdown ──────────────────────────────────────────────────────
 
 function shutdown(): void {
   if (shuttingDown) return
   shuttingDown = true
   log.info('shutting down')
+
+  // Stop all cron jobs
+  stopAllJobs()
 
   // Close WebSocket
   if (ws) {
@@ -549,6 +629,8 @@ void (async () => {
     mm.botUsername = me.username
     log.info(`authenticated as @${mm.botUsername}`)
     log.info(`max sessions=${MAX_SESSIONS}, idle timeout=${IDLE_TIMEOUT_MS / 1000}s`)
+    loadAllSchedules()
+    startScheduleWatcher()
     connectWebSocket()
   } catch (err) {
     log.error(`auth failed: ${err}`)

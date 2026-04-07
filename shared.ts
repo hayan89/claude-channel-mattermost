@@ -10,7 +10,7 @@ import { randomBytes } from 'crypto'
 import {
   readFileSync, writeFileSync, mkdirSync, appendFileSync,
   renameSync, realpathSync, chmodSync, unlinkSync,
-  rmdirSync, statSync,
+  statSync,
 } from 'fs'
 import { homedir } from 'os'
 import { join, sep } from 'path'
@@ -498,110 +498,4 @@ export function writeSchedules(channelId: string, schedules: ScheduleEntry[]): v
 
 export function generateScheduleId(): string {
   return 'sch_' + randomBytes(4).toString('hex')
-}
-
-// ── Crontab management ────────────────────────────────────────────────────
-
-const CRONTAB_TAG = 'claude-channel-mattermost'
-const CRONTAB_LOCK = join(SCHEDULES_DIR, '.crontab.lock')
-
-function acquireCrontabLock(): void {
-  mkdirSync(SCHEDULES_DIR, { recursive: true })
-  const deadline = Date.now() + 10_000
-  while (Date.now() < deadline) {
-    try {
-      mkdirSync(CRONTAB_LOCK)
-      return
-    } catch {
-      Bun.sleepSync(50)
-    }
-  }
-  // Force-acquire if stale (>30s old lock)
-  try {
-    const st = statSync(CRONTAB_LOCK)
-    if (Date.now() - st.mtimeMs > 30_000) {
-      rmdirSync(CRONTAB_LOCK)
-      mkdirSync(CRONTAB_LOCK)
-      return
-    }
-  } catch {}
-  throw new Error('crontab lock acquisition timed out')
-}
-
-function releaseCrontabLock(): void {
-  try { rmdirSync(CRONTAB_LOCK) } catch {}
-}
-
-function readCurrentCrontab(): string {
-  const result = Bun.spawnSync(['crontab', '-l'], { stderr: 'pipe' })
-  if (result.exitCode !== 0) return ''
-  return result.stdout.toString()
-}
-
-function writeCrontab(content: string): void {
-  const tmpFile = join('/tmp', `crontab-${Date.now()}.tmp`)
-  writeFileSync(tmpFile, content)
-  try {
-    const result = Bun.spawnSync(['crontab', tmpFile])
-    if (result.exitCode !== 0) {
-      throw new Error(`crontab write failed: exit ${result.exitCode}`)
-    }
-  } finally {
-    try { unlinkSync(tmpFile) } catch {}
-  }
-}
-
-export function addCrontabEntry(scheduleId: string, channelId: string, cronExpr: string): void {
-  mkdirSync(SCHEDULES_DIR, { recursive: true })
-  acquireCrontabLock()
-  try {
-    const current = readCurrentCrontab()
-    const bunPath = process.execPath
-    const triggerPath = join(import.meta.dir, 'trigger.ts')
-    const logPath = join(SCHEDULES_DIR, 'trigger.log')
-    const home = homedir()
-
-    const tag = `# ${CRONTAB_TAG}:${scheduleId}`
-    const entry = `${cronExpr} HOME=${home} ${bunPath} ${triggerPath} --schedule-id ${scheduleId} --channel-id ${channelId} 2>&1 | head -c 1000 >> ${logPath}`
-
-    const newContent = current.trimEnd() + '\n' + tag + '\n' + entry + '\n'
-    writeCrontab(newContent)
-  } finally {
-    releaseCrontabLock()
-  }
-}
-
-export function removeCrontabEntry(scheduleId: string): void {
-  acquireCrontabLock()
-  try {
-    const current = readCurrentCrontab()
-    if (!current) return
-    const lines = current.split('\n')
-    const filtered: string[] = []
-    for (let i = 0; i < lines.length; i++) {
-      if (lines[i] === `# ${CRONTAB_TAG}:${scheduleId}`) {
-        i++ // skip the next line (the actual cron entry)
-        continue
-      }
-      filtered.push(lines[i])
-    }
-    writeCrontab(filtered.join('\n'))
-  } finally {
-    releaseCrontabLock()
-  }
-}
-
-export function listCrontabEntries(): Array<{ scheduleId: string; line: string }> {
-  const current = readCurrentCrontab()
-  if (!current) return []
-  const lines = current.split('\n')
-  const entries: Array<{ scheduleId: string; line: string }> = []
-  for (let i = 0; i < lines.length; i++) {
-    const m = lines[i].match(new RegExp(`^# ${CRONTAB_TAG}:(\\S+)$`))
-    if (m && i + 1 < lines.length) {
-      entries.push({ scheduleId: m[1], line: lines[i + 1] })
-      i++
-    }
-  }
-  return entries
 }

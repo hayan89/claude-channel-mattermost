@@ -38,7 +38,6 @@ import {
   readNotes, writeNotes, formatNotesPrefix,
   readMode, writeMode, clearMode,
   readSchedules, writeSchedules, generateScheduleId,
-  addCrontabEntry, removeCrontabEntry,
 } from './shared.js'
 
 // ── .env loader ────────────────────────────────────────────────────────────
@@ -671,7 +670,6 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           createdAt: new Date().toISOString(),
         }
         writeSchedules(chatId, [...schedules, entry])
-        addCrontabEntry(id, chatId, cronExpr)
 
         return {
           content: [{ type: 'text', text: `schedule created: ${id}\ncron: ${cronExpr}\nprompt: ${prompt}${description ? '\ndescription: ' + description : ''}` }],
@@ -701,7 +699,6 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
           throw new Error(`schedule not found: ${scheduleId}`)
         }
         writeSchedules(chatId, schedules.filter(s => s.id !== scheduleId))
-        removeCrontabEntry(scheduleId)
         return { content: [{ type: 'text', text: `schedule deleted: ${scheduleId}` }] }
       }
 
