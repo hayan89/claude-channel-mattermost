@@ -28,13 +28,17 @@ import { basename, join } from 'path'
 import {
   APPROVED_DIR, ENV_FILE, INBOX_DIR,
   MAX_CHUNK_LIMIT, MAX_ATTACHMENT_BYTES,
+  MAX_SCHEDULES_PER_CHANNEL, SCHEDULED_RE,
   type Access, type MmClient, type AccessOps, type MentionContext, type InboxMessage,
+  type ScheduleEntry,
   loadEnvFile, createMmClient,
   readAccessFile, saveAccess as sharedSaveAccess,
   gate,
   chunk, assertSendable, safeAttName,
   readNotes, writeNotes, formatNotesPrefix,
   readMode, writeMode, clearMode,
+  readSchedules, writeSchedules, generateScheduleId,
+  addCrontabEntry, removeCrontabEntry,
 } from './shared.js'
 
 // ── .env loader ────────────────────────────────────────────────────────────
@@ -250,6 +254,8 @@ const mcp = new Server(
       'Plan mode: messages may include a [mode: plan] block. When present, only research and plan — do NOT make code changes (no Edit, Write, or destructive Bash commands). Ask clarifying questions if needed — the user can reply normally while plan mode stays active. When ready, present your plan clearly and wait for the user to approve with !go. If the user sends !cancel, acknowledge and stop. When [mode: plan-approved] appears, execute the plan you previously presented.',
       '',
       'For long-running tasks (file analysis, multi-step work, test execution), call update_status periodically to show progress. Keep status text short — a few words with context. Example: "Analyzing 15 files...", "Running tests (2/5 done)...", "Writing implementation...". Call it at natural transition points, not every second. The status message is automatically cleaned up when you send your final reply. Do not use update_status for tasks that take less than ~10 seconds.',
+      '',
+      'Scheduling: Users can ask you to set up recurring tasks. When they do, parse the time expression into a cron string and call schedule_create with the cron expression, prompt, and a human-friendly description. Use schedule_list to show existing schedules and schedule_delete to remove them. Cron format: "minute hour day-of-month month day-of-week" (e.g. "0 9 * * 1-5" = weekdays 9am). Convert natural language time to cron expressions yourself.',
     ].join('\n'),
   },
 )
@@ -384,6 +390,44 @@ mcp.setRequestHandler(ListToolsRequestSchema, async () => ({
           thread_id: { type: 'string', description: 'Thread to post status in. Optional.' },
         },
         required: ['chat_id', 'status'],
+      },
+    },
+    {
+      name: 'schedule_create',
+      description: 'Create a recurring schedule. The bot will post the prompt at the specified cron time, triggering Claude to process it. Cron format: "minute hour day-of-month month day-of-week".',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chat_id: { type: 'string', description: 'Channel ID to bind the schedule to.' },
+          cron: { type: 'string', description: 'Cron expression (e.g. "0 9 * * *" for daily 9am, "0 9 * * 1-5" for weekdays 9am).' },
+          prompt: { type: 'string', description: 'The prompt Claude will execute at trigger time.' },
+          description: { type: 'string', description: 'Human-friendly description (e.g. "매일 오전 9시").' },
+          user_id: { type: 'string', description: 'Creator user ID.' },
+        },
+        required: ['chat_id', 'cron', 'prompt'],
+      },
+    },
+    {
+      name: 'schedule_list',
+      description: 'List all schedules registered for the current channel.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chat_id: { type: 'string', description: 'Channel ID.' },
+        },
+        required: ['chat_id'],
+      },
+    },
+    {
+      name: 'schedule_delete',
+      description: 'Delete a schedule by ID.',
+      inputSchema: {
+        type: 'object',
+        properties: {
+          chat_id: { type: 'string', description: 'Channel ID.' },
+          schedule_id: { type: 'string', description: 'Schedule ID to delete (e.g. "sch_abc12345").' },
+        },
+        required: ['chat_id', 'schedule_id'],
       },
     },
   ],
@@ -600,6 +644,67 @@ mcp.setRequestHandler(CallToolRequestSchema, async req => {
         return { content: [{ type: 'text', text: `status posted (id: ${p.id})` }] }
       }
 
+      case 'schedule_create': {
+        const chatId = args.chat_id as string
+        const cronExpr = (args.cron as string).trim()
+        const prompt = args.prompt as string
+        const description = args.description as string | undefined
+        const userId = (args.user_id as string) || 'unknown'
+        await assertAllowedChannel(chatId)
+
+        const schedules = readSchedules(chatId)
+        if (schedules.length >= MAX_SCHEDULES_PER_CHANNEL) {
+          throw new Error(`maximum schedules per channel (${MAX_SCHEDULES_PER_CHANNEL}) reached`)
+        }
+        const fields = cronExpr.split(/\s+/)
+        if (fields.length !== 5) {
+          throw new Error(`invalid cron expression: expected 5 fields, got ${fields.length}`)
+        }
+
+        const id = generateScheduleId()
+        const entry: ScheduleEntry = {
+          id,
+          cron: cronExpr,
+          prompt,
+          description,
+          createdBy: userId,
+          createdAt: new Date().toISOString(),
+        }
+        writeSchedules(chatId, [...schedules, entry])
+        addCrontabEntry(id, chatId, cronExpr)
+
+        return {
+          content: [{ type: 'text', text: `schedule created: ${id}\ncron: ${cronExpr}\nprompt: ${prompt}${description ? '\ndescription: ' + description : ''}` }],
+        }
+      }
+
+      case 'schedule_list': {
+        const chatId = args.chat_id as string
+        const schedules = readSchedules(chatId)
+        if (schedules.length === 0) {
+          return { content: [{ type: 'text', text: '(no schedules for this channel)' }] }
+        }
+        const lines = schedules.map(s =>
+          `${s.id} | ${s.cron} | ${s.description || '(no description)'} | ${s.prompt.length > 80 ? s.prompt.slice(0, 80) + '...' : s.prompt}`,
+        )
+        return { content: [{ type: 'text', text: lines.join('\n') }] }
+      }
+
+      case 'schedule_delete': {
+        const chatId = args.chat_id as string
+        const scheduleId = args.schedule_id as string
+        await assertAllowedChannel(chatId)
+
+        const schedules = readSchedules(chatId)
+        const entry = schedules.find(s => s.id === scheduleId)
+        if (!entry) {
+          throw new Error(`schedule not found: ${scheduleId}`)
+        }
+        writeSchedules(chatId, schedules.filter(s => s.id !== scheduleId))
+        removeCrontabEntry(scheduleId)
+        return { content: [{ type: 'text', text: `schedule deleted: ${scheduleId}` }] }
+      }
+
       default:
         return {
           content: [{ type: 'text', text: `unknown tool: ${req.params.name}` }],
@@ -677,7 +782,18 @@ function connectWebSocket(): void {
         post = JSON.parse(data.data.post) // ⚠️ JSON string inside JSON
       } catch { return }
 
-      if (post.user_id === mm.botUserId) return   // skip own messages
+      // skip own messages — except scheduled triggers
+      if (post.user_id === mm.botUserId) {
+        const scheduledMatch = ((post.message ?? '') as string).match(SCHEDULED_RE)
+        if (!scheduledMatch) return  // normal bot message — skip
+        // Scheduled trigger: bypass gate() and handle directly
+        const scheduleId = scheduledMatch[1]
+        const actualPrompt = (post.message as string).replace(scheduledMatch[0], '')
+        handleScheduledTrigger(post, scheduleId, actualPrompt).catch((e: unknown) =>
+          process.stderr.write(`mattermost: scheduled trigger failed: ${e}\n`),
+        )
+        return
+      }
       if (post.type?.trim()) return                // skip system posts
 
       const channelType = data.data.channel_type ?? ''
@@ -701,6 +817,40 @@ function connectWebSocket(): void {
 }
 
 // ── Inbound message handling ───────────────────────────────────────────────
+
+async function handleScheduledTrigger(post: any, scheduleId: string, prompt: string): Promise<void> {
+  const chatId = post.channel_id as string
+
+  // Look up schedule metadata for context injection
+  const schedules = readSchedules(chatId)
+  const entry = schedules.find(s => s.id === scheduleId)
+  const scheduleDesc = entry?.description || entry?.cron || scheduleId
+
+  const contextPrefix = `[scheduled-task: ${scheduleDesc}]\nThis message was automatically triggered by a scheduled task (${scheduleId}).\n[/scheduled-task]\n\n`
+  const content = contextPrefix + formatNotesPrefix(chatId) + prompt
+
+  // Typing heartbeat
+  const access = loadAccess()
+  if (access.typingHeartbeat !== false) {
+    startHeartbeat(chatId)
+  }
+
+  await mcp.notification({
+    method: 'notifications/claude/channel',
+    params: {
+      content,
+      meta: {
+        chat_id: chatId,
+        message_id: post.id,
+        user: 'scheduled-task',
+        user_id: mm.botUserId,
+        ts: new Date(post.create_at).toISOString(),
+      },
+    },
+  }).catch((err: Error) => {
+    process.stderr.write(`mattermost channel: failed to deliver scheduled trigger: ${err}\n`)
+  })
+}
 
 async function handleInbound(post: any, channelType: string, senderName: string): Promise<void> {
   const mentionCtx: MentionContext = { botUsername: mm.botUsername, sentIds: recentSentIds }
@@ -974,9 +1124,18 @@ function startInboxWatcher(): void {
     }
 
     const atts = msg.attachments ?? []
+    // Schedule context injection (channel scope mode)
+    let schedulePrefix = ''
+    if (msg.scheduledId) {
+      const schedules = readSchedules(chatId)
+      const sEntry = schedules.find(s => s.id === msg.scheduledId)
+      const scheduleDesc = sEntry?.description || sEntry?.cron || msg.scheduledId
+      schedulePrefix = `[scheduled-task: ${scheduleDesc}]\nThis message was automatically triggered by a scheduled task (${msg.scheduledId}).\n[/scheduled-task]\n\n`
+    }
+
     const attsStr = atts.map(a => `${a.name} (${a.mimeType}, ${a.sizeKB}KB)`).join('; ')
     const rawContent = effectiveMessage || (atts.length > 0 ? '(attachment)' : '')
-    const content = modePrefix + formatNotesPrefix(chatId) + rawContent
+    const content = schedulePrefix + modePrefix + formatNotesPrefix(chatId) + rawContent
 
     mcp.notification({
       method: 'notifications/claude/channel',

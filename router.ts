@@ -18,6 +18,7 @@ import { join, resolve } from 'path'
 
 import {
   STATE_DIR, APPROVED_DIR,
+  SCHEDULED_RE,
   type MmClient, type MentionContext, type InboxMessage,
   loadEnvFile, createMmClient,
   readAccessFile, saveAccess,
@@ -359,8 +360,30 @@ function connectWebSocket(): void {
         post = JSON.parse(data.data.post)
       } catch { return }
 
-      // Skip own messages
-      if (post.user_id === mm.botUserId) return
+      // Skip own messages — except scheduled triggers
+      if (post.user_id === mm.botUserId) {
+        const scheduledMatch = ((post.message ?? '') as string).match(SCHEDULED_RE)
+        if (!scheduledMatch) return  // normal bot message — skip
+
+        // Scheduled trigger: bypass gate(), route directly to channel
+        const scheduleId = scheduledMatch[1]
+        const actualPrompt = (post.message as string).replace(scheduledMatch[0], '')
+        const chatId = post.channel_id as string
+
+        const inboxMessage: InboxMessage = {
+          postId: post.id,
+          channelId: chatId,
+          userId: mm.botUserId,
+          userName: 'scheduled-task',
+          message: actualPrompt,
+          rootId: undefined,
+          createAt: post.create_at,
+          channelType: data.data.channel_type ?? '',
+          scheduledId: scheduleId,
+        }
+        routeMessage(chatId, inboxMessage)
+        return
+      }
       // Skip system posts
       if (post.type?.trim()) return
 
