@@ -1,0 +1,18 @@
+[1mEdit file[22m
+~/.claude.json
+
+[38;5;231m 1287 [22m       ],
+[38;5;231m 1288 [22m       "env": {
+[38;5;231m 1289 [22m         "GRAFANA_URL": "https://example.test",
+[38;5;167m 1290 -[22m         "GRAFANA_SERVICE_ACCOUNT_TOKEN": "glsa_REDACTED_OLD"
+[38;5;77m 1290 +[22m         "GRAFANA_SERVICE_ACCOUNT_TOKEN": "glsa_REDACTED_NEW"
+[38;5;231m 1291 [22m       }
+[38;5;231m 1292 [22m     }
+
+Do you want to make this edit to .claude.json?
+1. Yes
+2. Yes, allow all edits in workspace/ during this session (shift+tab)
+3. No
+
+Esc to cancel
+Tab to amend

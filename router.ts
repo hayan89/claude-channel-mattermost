@@ -27,6 +27,12 @@ import {
   type AccessOps,
 } from './shared.js'
 
+import {
+  ApprovalDetector, resolveChoice, classifyWithClaude,
+  isSensitiveTarget, parseSensitiveEnv,
+  type Prompt,
+} from './approval-bridge.js'
+
 // ── .env loader ────────────────────────────────────────────────────────────
 
 loadEnvFile()
@@ -37,6 +43,16 @@ const PLUGIN_DIR = resolve('.')
 const MAX_SESSIONS = parseInt(process.env.MATTERMOST_MAX_SESSIONS ?? '10')
 const IDLE_TIMEOUT_MS = parseInt(process.env.MATTERMOST_IDLE_TIMEOUT ?? String(30 * 60 * 1000))
 const SESSIONS_DIR = join(STATE_DIR, 'sessions')
+
+// ── Approval bridge config ────────────────────────────────────────────────
+type ApprovalBridgeMode = 'off' | 'detect-only' | 'full'
+const APPROVAL_BRIDGE_MODE: ApprovalBridgeMode = (() => {
+  const v = (process.env.MATTERMOST_APPROVAL_BRIDGE ?? 'off').toLowerCase()
+  if (v === 'detect-only' || v === 'full') return v
+  return 'off'
+})()
+const APPROVAL_TIMEOUT_MS = parseInt(process.env.MATTERMOST_APPROVAL_TIMEOUT ?? String(5 * 60 * 1000))
+const SENSITIVE_KEYWORDS = parseSensitiveEnv(process.env.MATTERMOST_APPROVAL_SENSITIVE_PATHS)
 
 const log = createLogger('router')
 
@@ -76,6 +92,13 @@ const dmChannelToUser = new Map<string, string>()
 
 // ── Session management ─────────────────────────────────────────────────────
 
+type PendingApproval = {
+  prompt: Prompt
+  sentAt: number
+  timeoutHandle: ReturnType<typeof setTimeout>
+  reaskCount: number
+}
+
 type ChannelSession = {
   channelId: string
   claudeProcess: ReturnType<typeof Bun.spawn> | null
@@ -84,6 +107,8 @@ type ChannelSession = {
   inboxDir: string
   sessionDir: string
   messageQueue: InboxMessage[]
+  detector: ApprovalDetector | null
+  awaitingApproval: PendingApproval | null
 }
 
 const sessions = new Map<string, ChannelSession>()
@@ -104,6 +129,8 @@ function createSession(channelId: string): ChannelSession {
     inboxDir,
     sessionDir,
     messageQueue: [],
+    detector: APPROVAL_BRIDGE_MODE === 'off' ? null : new ApprovalDetector(),
+    awaitingApproval: null,
   }
   sessions.set(channelId, session)
 
@@ -143,8 +170,9 @@ function createSession(channelId: string): ChannelSession {
     } catch {}
   }, 1500)
 
-  // Pipe stdout/stderr to log files (append, with session marker)
-  pipeToLog(proc.stdout, stdoutLog, channelId)
+  // Pipe stdout/stderr to log files (append, with session marker).
+  // detector는 stdout에만 연결 (stderr는 오탐/성능 회피).
+  pipeToLog(proc.stdout, stdoutLog, channelId, session.detector ?? undefined, session)
   pipeToLog(proc.stderr, stderrLog, channelId)
 
   // Process exit detection
@@ -163,7 +191,13 @@ function createSession(channelId: string): ChannelSession {
 
 const MAX_CLAUDE_LOG_BYTES = 20 * 1024 * 1024  // 20 MB cap before rotation
 
-function pipeToLog(stream: ReadableStream<Uint8Array> | null, logPath: string, channelId: string): void {
+function pipeToLog(
+  stream: ReadableStream<Uint8Array> | null,
+  logPath: string,
+  channelId: string,
+  detector?: ApprovalDetector,
+  session?: ChannelSession,
+): void {
   if (!stream) return
 
   // Rotate if oversized (keep last .1 as backup)
@@ -178,7 +212,12 @@ function pipeToLog(stream: ReadableStream<Uint8Array> | null, logPath: string, c
   const out = createWriteStream(logPath, { flags: 'a' })
   out.write(`\n===== spawn ${channelId} @ ${new Date().toISOString()} =====\n`)
 
-  const reader = stream.getReader()
+  // Flag-gated tee: detector 미전달이면 기존 단일 reader 경로로 즉시 롤백 가능.
+  const [logStream, detectStream] = detector && session
+    ? stream.tee()
+    : [stream, null] as const
+
+  const reader = logStream.getReader()
   void (async () => {
     try {
       while (true) {
@@ -189,6 +228,25 @@ function pipeToLog(stream: ReadableStream<Uint8Array> | null, logPath: string, c
     } catch {}
     out.end()
   })()
+
+  if (detector && session && detectStream) {
+    const dReader = detectStream.getReader()
+    void (async () => {
+      try {
+        while (true) {
+          const { done, value } = await dReader.read()
+          if (done) break
+          detector.feed(value)
+          const prompt = detector.detect()
+          if (prompt) {
+            void dispatchApproval(session, prompt).catch(err =>
+              log.error(`dispatchApproval failed: ${err}`),
+            )
+          }
+        }
+      } catch {}
+    })()
+  }
 }
 
 function watchForReady(session: ChannelSession): void {
@@ -226,10 +284,152 @@ function watchForReady(session: ChannelSession): void {
   })
 }
 
+// ── Approval bridge ────────────────────────────────────────────────────────
+
+function formatApprovalMessage(prompt: Prompt, sensitiveHit: string | null): string {
+  const optsText = prompt.options.map(o => `${o.index}. ${o.label}`).join('\n')
+  if (sensitiveHit) {
+    return [
+      '⚠️ 중요 설정 편집 승인 요청 감지',
+      '',
+      `> ${prompt.question}`,
+      '',
+      optsText,
+      '',
+      `민감 키워드 \`${sensitiveHit}\` 가 감지돼 채널에서 자동 승인하지 않습니다.`,
+      'CLI 세션에서 직접 처리해 주세요.',
+      `${Math.floor(APPROVAL_TIMEOUT_MS / 60000)}분 내 처리되지 않으면 세션 hang 방지를 위해 자동 거부됩니다.`,
+    ].join('\n')
+  }
+  return [
+    '🔐 승인 요청',
+    '',
+    `> ${prompt.question}`,
+    '',
+    optsText,
+    '',
+    `${Math.floor(APPROVAL_TIMEOUT_MS / 60000)}분 내 응답 없으면 자동 거부됩니다. (숫자 또는 자연어 응답 가능)`,
+  ].join('\n')
+}
+
+async function dispatchApproval(session: ChannelSession, prompt: Prompt): Promise<void> {
+  // 같은 hash가 이미 대기 중이면 스킵
+  if (session.awaitingApproval && session.awaitingApproval.prompt.hash === prompt.hash) return
+
+  // 다른 prompt가 대기 중이었으면 timeout clear (새 것으로 교체)
+  if (session.awaitingApproval) {
+    clearTimeout(session.awaitingApproval.timeoutHandle)
+    log.info(`channel ${session.channelId} approval replaced (new prompt)`)
+  }
+
+  const sensitiveHit = isSensitiveTarget(prompt, SENSITIVE_KEYWORDS)
+  const message = formatApprovalMessage(prompt, sensitiveHit)
+
+  log.info(`channel ${session.channelId} approval needed: ${prompt.kind} (${prompt.hash})${sensitiveHit ? ` SENSITIVE=${sensitiveHit}` : ''} mode=${APPROVAL_BRIDGE_MODE}`)
+
+  if (APPROVAL_BRIDGE_MODE === 'detect-only') {
+    return
+  }
+
+  // full mode
+  try {
+    await mm.post('/posts', {
+      channel_id: session.channelId,
+      message,
+    })
+  } catch (err) {
+    log.error(`failed to send approval prompt: ${err}`)
+  }
+
+  const timeoutHandle = setTimeout(() => {
+    if (!session.awaitingApproval || session.awaitingApproval.prompt.hash !== prompt.hash) return
+    log.info(`channel ${session.channelId} approval timeout — auto-deny ${prompt.defaultDenyIndex}`)
+    void mm.post('/posts', {
+      channel_id: session.channelId,
+      message: '⏱ 승인 시간 초과 — 자동 거부 처리합니다.',
+    }).catch(() => {})
+    injectChoice(session, prompt.defaultDenyIndex, prompt.hash)
+    session.awaitingApproval = null
+  }, APPROVAL_TIMEOUT_MS)
+
+  session.awaitingApproval = {
+    prompt,
+    sentAt: Date.now(),
+    timeoutHandle,
+    reaskCount: 0,
+  }
+}
+
+function injectChoice(session: ChannelSession, index: number, promptHash?: string): boolean {
+  const proc = session.claudeProcess
+  if (!proc) return false
+  try {
+    const stdin = proc.stdin as { write(data: Uint8Array): void; flush(): void }
+    stdin.write(new TextEncoder().encode(`${index}\r`))
+    stdin.flush()
+    if (promptHash && session.detector) {
+      session.detector.suppressHash(promptHash, 2_000)
+    }
+    return true
+  } catch (err) {
+    log.error(`channel ${session.channelId} stdin write failed: ${err}`)
+    return false
+  }
+}
+
+async function handleApprovalReply(session: ChannelSession, userText: string): Promise<boolean> {
+  const pending = session.awaitingApproval
+  if (!pending) return false
+
+  // 민감 경로 안내 모드: 사용자 응답 무시하지 않고 그대로 통과 (CLI에서 처리하라는 안내).
+  // 단, 사용자가 명시 거부를 보내면 즉시 거부 주입해서 hang을 짧게 끝낼 수 있게.
+  const result = await resolveChoice(userText, pending.prompt, classifyWithClaude)
+
+  if ('ambiguous' in result) {
+    if (pending.reaskCount < 1) {
+      pending.reaskCount += 1
+      void mm.post('/posts', {
+        channel_id: session.channelId,
+        message: '❓ 선택을 명확히 답해주세요. 숫자 (1/2/3...) 또는 옵션 키워드로 회신.',
+      }).catch(() => {})
+      return true  // 메시지는 inbox로 포워드하지 않음
+    }
+    // 2회 실패 — inbox로 포워드 (일반 대화 가능성), 승인 대기는 유지
+    return false
+  }
+
+  // 성공
+  clearTimeout(pending.timeoutHandle)
+  const ok = injectChoice(session, result.index, pending.prompt.hash)
+  session.awaitingApproval = null
+  if (ok) {
+    const chosen = pending.prompt.options.find(o => o.index === result.index)
+    void mm.post('/posts', {
+      channel_id: session.channelId,
+      message: `✅ 선택 반영: \`${result.index}. ${chosen?.label ?? ''}\` (${result.reason})`,
+    }).catch(() => {})
+  } else {
+    void mm.post('/posts', {
+      channel_id: session.channelId,
+      message: '⚠️ 응답 주입 실패 — 세션을 재시작해야 할 수 있습니다.',
+    }).catch(() => {})
+  }
+  return true
+}
+
+function clearPendingApproval(session: ChannelSession): void {
+  if (session.awaitingApproval) {
+    clearTimeout(session.awaitingApproval.timeoutHandle)
+    session.awaitingApproval = null
+  }
+}
+
 function stopSession(channelId: string): void {
   const session = sessions.get(channelId)
   if (!session) return
   session.state = 'stopping'
+
+  clearPendingApproval(session)
 
   if (session.claudeProcess) {
     log.info(`stopping channel ${channelId}`)
@@ -270,6 +470,24 @@ function ensureSession(channelId: string): ChannelSession {
 function routeMessage(channelId: string, message: InboxMessage): void {
   const session = ensureSession(channelId)
   session.lastActivity = Date.now()
+
+  // Approval bridge: 승인 대기 중이면 응답으로 먼저 해석 (mode 명령은 통과)
+  if (
+    APPROVAL_BRIDGE_MODE === 'full' &&
+    session.awaitingApproval &&
+    !message.modeCommand
+  ) {
+    void handleApprovalReply(session, message.message).then(consumed => {
+      if (consumed) return
+      // 가로채지 않은 경우 일반 메시지로 처리
+      if (session.state === 'starting') {
+        session.messageQueue.push(message)
+      } else {
+        writeToInbox(session, message)
+      }
+    }).catch(err => log.error(`approval reply failed: ${err}`))
+    return
+  }
 
   if (session.state === 'starting') {
     session.messageQueue.push(message)
