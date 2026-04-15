@@ -33,6 +33,8 @@ import {
   type Prompt,
 } from './approval-bridge.js'
 
+import { formatWebhookAttachments } from './webhook-format.js'
+
 // ── .env loader ────────────────────────────────────────────────────────────
 
 loadEnvFile()
@@ -701,7 +703,36 @@ async function handleInbound(post: any, channelType: string, senderName: string)
     }
   }
 
-  // Plan mode command detection
+  // Webhook fast-path: format attachments and skip plan-mode parsing.
+  const isWebhook = post.props?.from_webhook === 'true'
+  if (isWebhook) {
+    const overrideName = typeof post.props?.override_username === 'string'
+      ? post.props.override_username
+      : ''
+    const formatted = formatWebhookAttachments(post)
+    if (formatted == null) {
+      log.info(`webhook drop (empty payload): channel=${chatId} source=${overrideName || 'unknown'} postId=${post.id}`)
+      return
+    }
+    const inboxMessage: InboxMessage = {
+      postId: post.id,
+      channelId: chatId,
+      userId: post.user_id,
+      userName: overrideName || senderName || 'webhook',
+      message: formatted,
+      rootId: post.root_id || undefined,
+      fileIds: fileIds.length > 0 ? fileIds : undefined,
+      createAt: post.create_at,
+      channelType,
+      attachments: atts.length > 0 ? atts : undefined,
+      isWebhook: true,
+      webhookSource: overrideName || 'unknown',
+    }
+    routeMessage(chatId, inboxMessage)
+    return
+  }
+
+  // Plan mode command detection (regular user messages only)
   const msg = (post.message ?? '') as string
   const planMatch = msg.match(/^!plan\b\s*([\s\S]*)/)
   const goMatch = msg.match(/^!(go|execute|approve)\b\s*([\s\S]*)/)

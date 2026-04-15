@@ -1,0 +1,38 @@
+// Bun Snapshot v1, https://bun.sh/docs/test/snapshots
+
+exports[`formatWebhookAttachments — Grafana-style alert snapshot 1`] = `
+"\`\`\`text
+High CPU usage [FIRING:1] (https://grafana.example.com/alerting/1/view)
+CPU above 90% for 5 minutes
+Status: firing
+Severity: critical
+Dashboard: https://grafana.example.com/d/abc/host
+Color: #D63232
+Footer: Grafana v10.2.0
+Timestamp: 1700000000
+\`\`\`"
+`;
+
+exports[`formatWebhookAttachments — GitHub-style PR notification snapshot 1`] = `
+"\`\`\`text
+Author: octocat
+New pull request opened
+PR #42: Add webhook handler (https://github.com/example/repo/pull/42)
+Implements the webhook catching feature discussed in #40.
+Repository: example/repo
+Branch: feat/webhook
+\`\`\`"
+`;
+
+exports[`formatWebhookAttachments — PagerDuty-style incident snapshot 1`] = `
+"\`\`\`text
+Incident triggered
+
+---
+PD-12345: Database connection failure
+Incident: PD-12345
+Severity: high
+Service: payments-api
+Color: danger
+\`\`\`"
+`;

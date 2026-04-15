@@ -112,6 +112,17 @@ export type PendingEntry = {
 export type GroupPolicy = {
   requireMention: boolean
   allowFrom: string[]
+  /**
+   * Forward Mattermost incoming webhooks to Claude. Off by default.
+   * `allowedSources` is an `override_username` allowlist:
+   *   - `["grafana", "github"]` — only these sender names pass
+   *   - `["*"]` — wildcard, any non-empty `override_username` passes (high risk;
+   *     equivalent to letting any webhook-token holder trigger Claude)
+   *   - `[]` — opt-in flag set but every source blocked (safe default for new channels)
+   * `override_username` must be a non-empty string in all cases — anonymous
+   * webhooks (no `override_username`) are always dropped.
+   */
+  forwardWebhooks?: { allowedSources: string[] }
 }
 
 export type Access = {
@@ -168,6 +179,14 @@ export type InboxMessage = {
   modeCommand?: 'plan' | 'go' | 'cancel'
   modeExtra?: string
   scheduledId?: string
+  /** True if this message originated from a Mattermost incoming webhook. */
+  isWebhook?: boolean
+  /**
+   * Sender-asserted source identifier (`post.props.override_username`).
+   * NOT authenticated — any webhook-token holder can set this to any string.
+   * Use only as context hint, never as authorization signal.
+   */
+  webhookSource?: string
 }
 
 // ── Mattermost REST client ─────────────────────────────────────────────────
@@ -349,6 +368,24 @@ export async function gate(
   const channelId = post.channel_id as string
   const policy = access.groups[channelId]
   if (!policy) return { action: 'drop' }
+
+  // Webhook fast-path: bypass allowFrom/requireMention if channel opted in
+  // and the sender-asserted override_username matches the allowlist.
+  const isWebhook = post.props?.from_webhook === 'true'
+  if (isWebhook && policy.forwardWebhooks) {
+    const allowed = policy.forwardWebhooks.allowedSources ?? []
+    const overrideName = typeof post.props?.override_username === 'string'
+      ? post.props.override_username
+      : ''
+    // Anonymous webhooks (no override_username) are always dropped, even with "*".
+    if (overrideName && (allowed.includes('*') || allowed.includes(overrideName))) {
+      return { action: 'deliver', access }
+    }
+    // Explicitly opted-in but mismatched source — drop instead of falling through
+    // to the normal gate (regular user gating doesn't apply to webhook posts).
+    return { action: 'drop' }
+  }
+
   const groupAllowFrom = policy.allowFrom ?? []
   const requireMention = policy.requireMention ?? true
   if (groupAllowFrom.length > 0 && !groupAllowFrom.includes(senderId)) {
