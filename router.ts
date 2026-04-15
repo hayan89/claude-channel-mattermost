@@ -12,7 +12,7 @@
 
 import {
   readFileSync, writeFileSync, mkdirSync, readdirSync, rmSync,
-  statSync, renameSync, watch,
+  statSync, renameSync, watch, createWriteStream,
 } from 'fs'
 import { join, resolve, basename } from 'path'
 import { Cron } from 'croner'
@@ -143,9 +143,9 @@ function createSession(channelId: string): ChannelSession {
     } catch {}
   }, 1500)
 
-  // Pipe stdout/stderr to log files
-  pipeToLog(proc.stdout, stdoutLog)
-  pipeToLog(proc.stderr, stderrLog)
+  // Pipe stdout/stderr to log files (append, with session marker)
+  pipeToLog(proc.stdout, stdoutLog, channelId)
+  pipeToLog(proc.stderr, stderrLog, channelId)
 
   // Process exit detection
   proc.exited.then(code => {
@@ -161,20 +161,33 @@ function createSession(channelId: string): ChannelSession {
   return session
 }
 
-function pipeToLog(stream: ReadableStream<Uint8Array> | null, logPath: string): void {
+const MAX_CLAUDE_LOG_BYTES = 20 * 1024 * 1024  // 20 MB cap before rotation
+
+function pipeToLog(stream: ReadableStream<Uint8Array> | null, logPath: string, channelId: string): void {
   if (!stream) return
-  const writer = Bun.file(logPath).writer()
+
+  // Rotate if oversized (keep last .1 as backup)
+  try {
+    const size = statSync(logPath).size
+    if (size > MAX_CLAUDE_LOG_BYTES) {
+      try { rmSync(`${logPath}.1`, { force: true }) } catch {}
+      renameSync(logPath, `${logPath}.1`)
+    }
+  } catch { /* file absent is fine */ }
+
+  const out = createWriteStream(logPath, { flags: 'a' })
+  out.write(`\n===== spawn ${channelId} @ ${new Date().toISOString()} =====\n`)
+
   const reader = stream.getReader()
   void (async () => {
     try {
       while (true) {
         const { done, value } = await reader.read()
         if (done) break
-        writer.write(value)
-        writer.flush()
+        out.write(value)
       }
     } catch {}
-    writer.end()
+    out.end()
   })()
 }
 

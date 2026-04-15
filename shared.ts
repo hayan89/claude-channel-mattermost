@@ -192,20 +192,44 @@ export function createMmClient(url: string, token: string): MmClient {
     botUsername: '',
 
     async api(method: string, path: string, body?: unknown): Promise<any> {
-      const res = await fetch(`${client.url}/api/v4${path}`, {
-        method,
-        headers: {
-          'Authorization': `Bearer ${client.token}`,
-          'Content-Type': 'application/json',
-        },
-        ...(body != null ? { body: JSON.stringify(body) } : {}),
-      })
-      if (!res.ok) {
-        const detail = await res.text().catch(() => '')
-        throw new Error(`MM API ${method} ${path}: ${res.status} ${detail}`)
+      const delays = [500, 1500, 4500]  // 3 retries on transient errors
+      let lastErr: unknown
+      for (let attempt = 0; attempt <= delays.length; attempt++) {
+        try {
+          const res = await fetch(`${client.url}/api/v4${path}`, {
+            method,
+            headers: {
+              'Authorization': `Bearer ${client.token}`,
+              'Content-Type': 'application/json',
+            },
+            ...(body != null ? { body: JSON.stringify(body) } : {}),
+          })
+          if (!res.ok) {
+            const detail = await res.text().catch(() => '')
+            const err = new Error(`MM API ${method} ${path}: ${res.status} ${detail}`)
+            if (res.status >= 500 && res.status < 600 && attempt < delays.length) {
+              sharedLog.debug(`MM ${method} ${path} ${res.status}, retrying in ${delays[attempt]}ms`)
+              lastErr = err
+              await new Promise(r => setTimeout(r, delays[attempt]))
+              continue
+            }
+            throw err
+          }
+          const text = await res.text()
+          return text ? JSON.parse(text) : undefined
+        } catch (err) {
+          // Network-level fetch failure → retry
+          if (err instanceof Error && err.message.startsWith('MM API ')) throw err
+          if (attempt < delays.length) {
+            sharedLog.debug(`MM ${method} ${path} network error, retrying in ${delays[attempt]}ms: ${err}`)
+            lastErr = err
+            await new Promise(r => setTimeout(r, delays[attempt]))
+            continue
+          }
+          throw err
+        }
       }
-      const text = await res.text()
-      return text ? JSON.parse(text) : undefined
+      throw lastErr ?? new Error(`MM API ${method} ${path}: exhausted retries`)
     },
 
     get(p: string) { return client.api('GET', p) },
