@@ -8,6 +8,7 @@ node_modules/
 # Runtime state (per-user)
 .omc/
 .claude/
+scraper/data/
 
 # OS artifacts
 .DS_Store
